@@ -4,9 +4,12 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "npm run generate:api",
     "dev": "vite",
+    "prebuild": "npm run generate:api",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "pretypecheck": "npm run generate:api",
     "typecheck": "vue-tsc --noEmit",
     "generate:spec": "cd .. && cargo run -p wkdmgr-mgmt --quiet -- --print-openapi > frontend/openapi.json",
     "generate:types": "openapi-typescript openapi.json -o src/api-types.ts",
