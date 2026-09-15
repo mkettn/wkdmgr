@@ -49,11 +49,15 @@ pub fn build_app(state: AppState, frontend_dist_dir: Option<PathBuf>) -> Router 
 }
 
 /// The single source of truth for the `/api/*` contract. `wkdmgr-mgmt
-/// --print-openapi` dumps this as JSON; the frontend's generated
-/// TypeScript client (`frontend/src/api-types.ts`) is derived from that
-/// output via `openapi-typescript`, so the two implementations cannot
-/// drift silently -- see `openapi_spec_is_up_to_date` in this crate's
-/// integration test for the guard that enforces it.
+/// --print-openapi` dumps this as JSON, and the frontend's TypeScript
+/// client (`frontend/src/api-types.ts`, gitignored) is generated from
+/// that output via `openapi-typescript` as part of `npm run dev` /
+/// `build` / `typecheck` (see `predev`/`prebuild`/`pretypecheck` in
+/// `frontend/package.json`), so nothing there is hand-typed against a
+/// second copy of the contract. There is currently no automated check
+/// that a Rust change to this contract was followed by regenerating the
+/// frontend client -- generation-at-build-time stops drift the moment
+/// someone runs it, but nothing fails if they don't.
 #[derive(OpenApi)]
 #[openapi(
     paths(get_me, list_keys, upload_key, delete_key),
@@ -98,8 +102,8 @@ impl FromRequestParts<AppState> for AuthenticatedUid {
 #[derive(Serialize, ToSchema)]
 struct ApiErrorBody {
     /// A fixed, machine-matchable error code (e.g. `parse_failed`,
-    /// `address_not_owned`, `already_exists`, `no_matching_uid`,
-    /// `not_found`).
+    /// `expired`, `address_not_owned`, `domain_not_served`,
+    /// `already_exists`, `no_matching_uid`, `not_found`).
     error: String,
     /// A human-readable explanation, safe to display to the user.
     message: String,
@@ -140,7 +144,7 @@ impl ApiError {
     fn domain_not_served(domain: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
-            "address_not_owned",
+            "domain_not_served",
             format!("{domain} is not a domain served by this instance"),
         )
     }
@@ -174,6 +178,7 @@ impl ApiError {
                 "no_matching_uid",
                 format!("the key has no valid signature for {address}"),
             ),
+            KeyError::Expired(m) => Self::new(StatusCode::BAD_REQUEST, "expired", m),
         }
     }
 }
@@ -235,6 +240,10 @@ struct KeyResponseItem {
     fingerprint: String,
     uploaded_at: String,
     revoked: bool,
+    /// RFC3339, if this key's primary key expires. `null` for a
+    /// non-expiring key. A key past this time is no longer served over
+    /// WKD even though the row is still listed here.
+    expires_at: Option<String>,
 }
 
 impl From<wkdmgr_core::storage::KeyRecord> for KeyResponseItem {
@@ -246,6 +255,7 @@ impl From<wkdmgr_core::storage::KeyRecord> for KeyResponseItem {
             fingerprint: r.fingerprint,
             uploaded_at: r.uploaded_at,
             revoked: r.revoked,
+            expires_at: r.expires_at,
         }
     }
 }
@@ -287,14 +297,20 @@ struct UploadRequest {
     key: String,
 }
 
-/// Publish a minimized key for one of the authenticated uid's addresses
+/// Publish a minimized key for one of the authenticated uid's addresses.
+/// If the address was previously published under a *different* uid that
+/// `UserDb` no longer reports as its owner, this replaces that row
+/// rather than 409ing -- see `wkdmgr_core::storage::insert_key` -- since
+/// otherwise a reassigned address would strand both the old and new
+/// owner. Re-publishing over your own still-current key still 409s: you
+/// need to delete it first.
 #[utoipa::path(
     post,
     path = "/api/keys",
     request_body = UploadRequest,
     responses(
         (status = 201, description = "Published", body = KeyResponseItem),
-        (status = 400, description = "parse_failed | no_matching_uid | address_not_owned", body = ApiErrorBody),
+        (status = 400, description = "parse_failed | expired | no_matching_uid | address_not_owned | domain_not_served", body = ApiErrorBody),
         (status = 401, description = "Missing SSO identity header", body = ApiErrorBody),
         (status = 409, description = "already_exists -- delete the existing key first", body = ApiErrorBody),
         (status = 502, description = "UserDb backend unavailable", body = ApiErrorBody),
@@ -334,10 +350,15 @@ async fn upload_key(
     let minimized = wkdmgr_core::openpgp::minimize_for_address(&cert, &body.address)
         .map_err(ApiError::from_key_error)?;
     let fingerprint = wkdmgr_core::openpgp::fingerprint_hex(&cert);
-    // Computed once here and cached in the `revoked` column: this is the
-    // only place revocation status can change (a fresh upload), so
-    // wkdmgr-query never needs to re-parse the blob on every lookup.
+    // Computed once here and cached in the `revoked`/`expires_at`
+    // columns: revocation status can only change via a fresh upload, so
+    // wkdmgr-query never needs to re-parse the blob to check it. Expiry
+    // is different -- it moves on its own -- so it's stored as a
+    // timestamp wkdmgr-query compares against "now" on every lookup,
+    // not a cached boolean.
     let revoked = wkdmgr_core::openpgp::is_revoked(&minimized);
+    let expires_at =
+        wkdmgr_core::openpgp::expiration_time(&cert).map_err(ApiError::from_key_error)?;
 
     let db = state.db.clone();
     let uid_owned = uid.0.clone();
@@ -348,16 +369,19 @@ async fn upload_key(
     let minimized_for_insert = minimized.clone();
 
     let insert_result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().expect("db mutex poisoned");
+        let mut conn = db.lock().expect("db mutex poisoned");
         wkdmgr_core::storage::insert_key(
-            &conn,
-            &uid_owned,
-            &domain_owned,
-            &address,
-            &wkd_hash_owned,
-            &fingerprint_owned,
-            &minimized_for_insert,
-            revoked,
+            &mut conn,
+            &wkdmgr_core::storage::NewKey {
+                uid: &uid_owned,
+                domain: &domain_owned,
+                address: &address,
+                wkd_hash: &wkd_hash_owned,
+                fingerprint: &fingerprint_owned,
+                key_data: &minimized_for_insert,
+                revoked,
+                expires_at,
+            },
         )
     })
     .await

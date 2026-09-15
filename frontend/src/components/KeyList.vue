@@ -13,6 +13,12 @@ const emit = defineEmits<{
 const pendingId = ref<string | null>(null)
 const errorMessage = ref('')
 
+function statusFor(key: KeyResponseItem): 'published' | 'revoked' | 'expired' {
+  if (key.revoked) return 'revoked'
+  if (key.expires_at && new Date(key.expires_at).getTime() <= Date.now()) return 'expired'
+  return 'published'
+}
+
 async function onDelete(id: string) {
   errorMessage.value = ''
   pendingId.value = id
@@ -46,8 +52,8 @@ async function onDelete(id: string) {
         <td class="mono">{{ key.address }}</td>
         <td class="mono fingerprint">{{ key.fingerprint }}</td>
         <td>
-          <span :class="['badge', key.revoked ? 'badge--revoked' : 'badge--published']">
-            {{ key.revoked ? 'revoked' : 'published' }}
+          <span :class="['badge', `badge--${statusFor(key)}`]">
+            {{ statusFor(key) }}
           </span>
         </td>
         <td>{{ new Date(key.uploaded_at).toLocaleString() }}</td>
@@ -119,7 +125,8 @@ async function onDelete(id: string) {
   color: var(--accent);
 }
 
-.badge--revoked {
+.badge--revoked,
+.badge--expired {
   background: color-mix(in srgb, var(--danger) 18%, transparent);
   color: var(--danger);
 }

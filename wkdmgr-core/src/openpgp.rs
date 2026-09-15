@@ -13,10 +13,12 @@ use thiserror::Error;
 pub enum KeyError {
     #[error("failed to parse key material: {0}")]
     ParseFailed(String),
-    #[error("key has no valid, non-expired self-signature on its primary key: {0}")]
+    #[error("key has no valid self-signature on its primary key: {0}")]
     InvalidPrimaryKey(String),
     #[error("key has no valid User ID matching {0}")]
     NoMatchingUserId(String),
+    #[error("key has expired: {0}")]
+    Expired(String),
 }
 
 /// Parse an uploaded key (ASCII-armored or binary). Rejects anything that
@@ -58,14 +60,19 @@ pub fn parse_key_material(input: &str) -> Result<Cert, KeyError> {
     Cert::from_bytes(&decoded).map_err(|e| KeyError::ParseFailed(e.to_string()))
 }
 
-/// Validate that `cert` has a valid, non-expired self-signature on its
-/// primary key (per `StandardPolicy`), and that it has a User ID matching
-/// `address` (case-insensitive) with a valid binding self-signature.
+/// Validate that `cert` has a valid self-signature on its primary key
+/// (per `StandardPolicy`), that the primary key is currently live (not
+/// expired), and that it has a User ID matching `address`
+/// (case-insensitive) with a valid binding self-signature.
 pub fn validate_for_address(cert: &Cert, address: &str) -> Result<(), KeyError> {
     let policy = StandardPolicy::new();
     let valid_cert = cert
         .with_policy(&policy, None)
         .map_err(|e| KeyError::InvalidPrimaryKey(e.to_string()))?;
+
+    valid_cert
+        .alive()
+        .map_err(|e| KeyError::Expired(e.to_string()))?;
 
     let has_match = valid_cert
         .userids()
@@ -76,6 +83,23 @@ pub fn validate_for_address(cert: &Cert, address: &str) -> Result<(), KeyError> 
     } else {
         Err(KeyError::NoMatchingUserId(address.to_string()))
     }
+}
+
+/// The primary key's expiration time, if it has one (`None` for a
+/// non-expiring key). Stored as `keys.expires_at` so `wkdmgr-query` can
+/// stop serving a key that was live at upload time but has since
+/// expired -- unlike revocation, expiry doesn't arrive via any upload
+/// at all, so it has to be checked at lookup time rather than cached
+/// from a one-time computation.
+pub fn expiration_time(cert: &Cert) -> Result<Option<chrono::DateTime<chrono::Utc>>, KeyError> {
+    let policy = StandardPolicy::new();
+    let valid_cert = cert
+        .with_policy(&policy, None)
+        .map_err(|e| KeyError::InvalidPrimaryKey(e.to_string()))?;
+    Ok(valid_cert
+        .primary_key()
+        .key_expiration_time()
+        .map(chrono::DateTime::<chrono::Utc>::from))
 }
 
 fn userid_matches(userid: &sequoia_openpgp::packet::UserID, address: &str) -> bool {
@@ -101,10 +125,11 @@ pub fn fingerprint_hex(cert: &Cert) -> String {
 /// certifications, and dropping them would make it impossible to ever
 /// publish a revocation through this API -- a revoked cert has to
 /// survive minimization for `is_revoked` to see it later). Matching
-/// happens against the raw, unvalidated User ID list so that an
-/// already-revoked address can still be found and minimized: an owner
-/// republishing their own revocation is exactly the case this needs to
-/// support, not reject.
+/// uses `valid_cert.userids()`, which -- despite the name -- still
+/// yields revoked User IDs (revocation and policy/liveness validity are
+/// independent checks in sequoia), so an already-revoked address can
+/// still be found and minimized: an owner republishing their own
+/// revocation is exactly the case this needs to support, not reject.
 ///
 /// Because the packets are rebuilt from the `PublicParts` view of each
 /// key exclusively, the result can never carry secret key material even
@@ -195,6 +220,21 @@ mod tests {
             builder = builder.add_userid(*uid);
         }
         let (cert, _revocation) = builder.generate().unwrap();
+        cert
+    }
+
+    fn cert_with_validity_period(
+        uid: &str,
+        creation_time: std::time::SystemTime,
+        validity_period: std::time::Duration,
+    ) -> Cert {
+        let (cert, _revocation) = CertBuilder::new()
+            .add_signing_subkey()
+            .add_userid(uid)
+            .set_creation_time(creation_time)
+            .set_validity_period(validity_period)
+            .generate()
+            .unwrap();
         cert
     }
 
@@ -403,5 +443,57 @@ mod tests {
             message.contains("armor"),
             "expected an armor-specific error, got: {message}"
         );
+    }
+
+    #[test]
+    fn validate_for_address_rejects_expired_cert() {
+        let now = std::time::SystemTime::now();
+        let sixty_days = std::time::Duration::from_secs(60 * 24 * 60 * 60);
+        let thirty_one_days = std::time::Duration::from_secs(31 * 24 * 60 * 60);
+        let cert = cert_with_validity_period(
+            "Alice <alice@example.com>",
+            now - sixty_days,
+            thirty_one_days,
+        );
+
+        let err = validate_for_address(&cert, "alice@example.com").unwrap_err();
+        assert!(matches!(err, KeyError::Expired(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_for_address_accepts_unexpired_cert_with_validity_period() {
+        let now = std::time::SystemTime::now();
+        let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+        let one_year = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+        let cert = cert_with_validity_period("Alice <alice@example.com>", now - one_day, one_year);
+
+        assert!(validate_for_address(&cert, "alice@example.com").is_ok());
+    }
+
+    #[test]
+    fn expiration_time_none_for_non_expiring_cert() {
+        let cert = cert_with_uids(&["Alice <alice@example.com>"]);
+        assert_eq!(expiration_time(&cert).unwrap(), None);
+    }
+
+    #[test]
+    fn expiration_time_matches_validity_period() {
+        // OpenPGP signature creation times have whole-second resolution,
+        // so floor `now` to a whole second before deriving the expected
+        // value -- otherwise this flakes on the sub-second remainder
+        // sequoia truncates away when generating the cert.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now_secs);
+        let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+        let one_year = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+        let creation_time = now - one_day;
+        let cert = cert_with_validity_period("Alice <alice@example.com>", creation_time, one_year);
+
+        let expiration = expiration_time(&cert).unwrap().expect("expected Some");
+        let expected: chrono::DateTime<chrono::Utc> = (creation_time + one_year).into();
+        assert_eq!(expiration, expected);
     }
 }

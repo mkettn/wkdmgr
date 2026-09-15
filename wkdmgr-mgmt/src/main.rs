@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let conn = wkdmgr_core::storage::open_writable(&cfg.db_path)?;
     let db = Arc::new(Mutex::new(conn));
+    let db_for_shutdown = db.clone();
 
     let state = AppState {
         db,
@@ -65,6 +66,47 @@ async fn main() -> anyhow::Result<()> {
         mode
     );
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // WAL mode means a plain read-only open (no write access to the
+    // containing directory) needs -wal/-shm to already exist, and
+    // SQLite deletes both when the last connection to the database
+    // closes cleanly -- which a graceful stop of the sole writer is.
+    // Checkpointing back to journal_mode=DELETE here leaves a file any
+    // read-only connection can open directly, no directory write access
+    // needed; open_writable() switches back to WAL on the next start.
+    // Best-effort: if another connection (e.g. a still-running
+    // wkdmgr-query with its own already-open handle) is attached,
+    // SQLite can't change the journal mode and this is a silent no-op,
+    // which is fine, since that connection already works. See the
+    // README's "Read-only access after a clean shutdown" note for the
+    // full picture, including the directory-permission fix this
+    // complements rather than replaces.
+    if let Ok(conn) = db_for_shutdown.lock() {
+        if let Err(e) = conn.pragma_update(None, "journal_mode", "DELETE") {
+            tracing::warn!("could not checkpoint database to journal_mode=DELETE on shutdown: {e}");
+        }
+    }
+
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

@@ -176,6 +176,7 @@ base_dn: ou=users,dc=example,dc=org
 uid_attr: uid
 mail_attr: mail
 alias_attr: mailAlternateAddress   # example only -- set to whatever your directory uses
+timeout_secs: 10   # optional, default shown
 ```
 
 `alias_attr` has no universal default across directory schemas, so it's
@@ -185,7 +186,15 @@ service user) rather than inline in YAML, like any other secret.
 
 wkdmgr searches `(<uid_attr>=<uid>)` under `base_dn`, and collects the
 single-valued `mail_attr` plus every value of the multi-valued
-`alias_attr` into one address list.
+`alias_attr` into one address list, matching attribute names
+case-insensitively against what the directory returns (LDAP attribute
+descriptors are case-insensitive, and servers don't all echo back the
+same casing you searched with).
+
+`timeout_secs` bounds the whole connect+bind+search sequence per
+lookup, so an unresponsive directory (packets dropped, a failed-over
+host still holding the VIP) fails fast with a `502` instead of hanging
+the request.
 
 ### Switching backends
 
@@ -290,6 +299,47 @@ WAL mode (set once at startup); `wkdmgr-query` opens the same file
 strictly read-only and never writes to it. Back it up like you would any
 real datastore.
 
+### Directory permissions: read-only access after a clean shutdown
+
+**The directory holding `db_path` must be writable by whichever group
+`wkdmgr-query` runs as, not just readable.** This is easy to get wrong
+under the two-service-user split this README otherwise recommends
+(`wkdwriter` for `wkdmgr-mgmt`, `wkdreader` for `wkdmgr-query`, each only
+able to read the other's socket) -- but WAL mode specifically needs it:
+
+A WAL-mode database is only fully readable via its `-wal`/`-shm`
+sidecar files. When the *last* connection to the database closes
+cleanly (a plain `systemctl stop wkdmgr-mgmt`, or a package upgrade's
+restart window, with no other connection open at that moment), SQLite
+checkpoints and deletes both sidecar files -- but `journal_mode=WAL`
+stays recorded in the database file's own header. The next connection,
+opening in WAL mode because the header says to, has to recreate `-shm`,
+which needs write access to the *directory*, not just the database
+file. A reader with read-only directory access gets `attempt to write a
+readonly database` on every query, and `wkdmgr-query`'s startup open
+still succeeds (it's the per-query `-shm` creation that fails), so this
+surfaces only as every WKD lookup 404ing -- indistinguishable from "no
+keys published" to anyone watching from outside.
+
+Recommended fix: put both service users in a shared group and make the
+directory `2775` (setgid, group-writable) rather than merely
+group-readable:
+
+```sh
+install -d -o wkdwriter -g wkdshared -m 2775 /var/lib/wkdmgr
+usermod -aG wkdshared wkdreader
+```
+
+The database file itself can stay whatever `wkdmgr-mgmt` creates it as
+(`wkdmgr-query` never needs to write to the file, only to be able to
+create `-shm` in its directory). As defense in depth, `wkdmgr-mgmt` also
+checkpoints back to `journal_mode=DELETE` on a graceful shutdown
+(`SIGTERM`/Ctrl-C) -- which leaves a file any read-only connection can
+open with no sidecar files needed at all, and switches back to WAL on
+the next start -- but that's best-effort (a `SIGKILL`, or another
+process still holding the database open at shutdown time, means it
+doesn't happen) and is not a substitute for the directory permission.
+
 ## Design decision: minimization strips third-party certifications
 
 Per the WKD spec's own security considerations, a published key contains
@@ -344,6 +394,41 @@ only way revocation status can change at all is a fresh upload, so
 there's nothing to recompute in between. The row stays visible (marked
 `revoked: true`) in `GET /api/keys` so an owner can still see and manage
 it; `wkdmgr-query`'s `SELECT` simply filters `revoked = 0`.
+
+## Key expiry
+
+Unlike revocation, expiry isn't triggered by an upload -- a key that's
+live when published can simply age past its own expiration date with no
+further action from anyone. So it's checked differently: `keys.expires_at`
+stores the primary key's expiration time (`NULL` for a non-expiring
+key), and `wkdmgr-query`'s lookup filters `expires_at IS NULL OR
+expires_at > <now>` on every request, rather than caching a boolean the
+way revocation does. A key stops being served the moment it expires,
+with no re-upload needed to trigger that -- and, same as revocation, a
+404 for an expired key is indistinguishable from "no key published".
+
+An already-expired cert is rejected at upload time (`400 expired`) --
+there's no legitimate reason to publish one, unlike revocation where
+publishing an already-revoked cert is exactly the point.
+
+## Address reassignment
+
+Address ownership (per `UserDb`) is only ever checked at upload time; a
+row's `uid` doesn't get rechecked afterward. When an address moves
+between people -- someone leaves and an alias gets reassigned, a shared
+role address changes hands -- `POST /api/keys` from the *new*, currently
+verified owner replaces the old row instead of `409`ing forever: without
+that, the old owner's key would keep being served indefinitely (mail
+encrypted to a key its current holder can't read), the new owner could
+never publish (`UNIQUE(domain, wkd_hash)` blocking the insert), and the
+new owner couldn't delete their way out either (uid-scoped delete can't
+touch a row it doesn't own).
+
+This replacement only happens when the row on file is owned by a
+*different* uid than the one now verified for that address. Re-uploading
+over your own still-current key is unaffected: that still `409`s and
+still requires an explicit delete first, per the API contract's "don't
+silently overwrite" guarantee.
 
 ## Non-goals (v1)
 

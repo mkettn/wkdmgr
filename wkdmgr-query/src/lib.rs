@@ -137,7 +137,17 @@ async fn lookup_and_respond(state: &AppState, domain: &str, hash: &str) -> Respo
             }
         }
         let conn = guard.as_ref().expect("just ensured Some above");
-        wkdmgr_core::storage::lookup_key_data(conn, &domain_lc, &hash_owned)
+        let outcome = wkdmgr_core::storage::lookup_key_data(conn, &domain_lc, &hash_owned);
+        if outcome.is_err() {
+            // The cached handle can outlive what it points to -- the
+            // file replaced by a backup restore or an atomic deploy
+            // rename, or a transient IO fault. Drop it so the next
+            // request reopens from scratch instead of every future
+            // lookup failing the same way until the process is
+            // restarted.
+            *guard = None;
+        }
+        outcome
     })
     .await;
 
@@ -159,4 +169,62 @@ async fn lookup_and_respond(state: &AppState, domain: &str, hash: &str) -> Respo
 
 fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cached connection must be dropped when a query through it
+    /// fails, not kept around to fail the same way on every future
+    /// request -- otherwise the DB being replaced out from under it (a
+    /// backup restore, an atomic deploy rename) or a transient IO fault
+    /// permanently 404s every lookup until the process restarts.
+    #[tokio::test]
+    async fn cached_connection_is_invalidated_on_error_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+
+        // Seed a valid database with one key, the way wkdmgr-mgmt would.
+        {
+            let mut conn = wkdmgr_core::storage::open_writable(&db_path).unwrap();
+            wkdmgr_core::storage::insert_key(
+                &mut conn,
+                &wkdmgr_core::storage::NewKey {
+                    uid: "alice",
+                    domain: "example.com",
+                    address: "alice@example.com",
+                    wkd_hash: "somehash",
+                    fingerprint: "ABCD1234",
+                    key_data: b"key bytes",
+                    revoked: false,
+                    expires_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let state = AppState::new(db_path.clone(), vec!["example.com".to_string()]);
+
+        // A normal lookup succeeds and caches the connection.
+        let ok = lookup_and_respond(&state, "example.com", "somehash").await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(state.db.lock().unwrap().is_some());
+
+        // Swap in a connection to a schema-less database, simulating a
+        // cached handle that's gone bad. The next query through it must
+        // fail with "no such table: keys"...
+        let broken = rusqlite::Connection::open_in_memory().unwrap();
+        *state.db.lock().unwrap() = Some(broken);
+
+        let failed = lookup_and_respond(&state, "example.com", "somehash").await;
+        assert_eq!(failed.status(), StatusCode::NOT_FOUND);
+        // ...and that must clear the cache, not keep the bad handle.
+        assert!(state.db.lock().unwrap().is_none());
+
+        // The next lookup reopens db_path (still valid) from scratch and
+        // recovers on its own, no restart needed.
+        let recovered = lookup_and_respond(&state, "example.com", "somehash").await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
 }

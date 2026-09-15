@@ -7,11 +7,32 @@ const props = defineProps<{
   keys: KeyResponseItem[]
 }>()
 
+type Status = 'published' | 'revoked' | 'expired' | 'no key'
+
+const statusLabel: Record<Status, string> = {
+  published: 'published',
+  revoked: 'revoked',
+  expired: 'expired',
+  'no key': 'no key',
+}
+
+// A key row existing is not the same as WKD actually serving it: a
+// revoked or expired key stays listed (so its owner can see and manage
+// it) but wkdmgr-query 404s it exactly like "no key published" -- so
+// this must not say "published" for either, or the badge asserts the
+// opposite of what a lookup would actually return.
+function statusFor(key: KeyResponseItem | undefined): Status {
+  if (!key) return 'no key'
+  if (key.revoked) return 'revoked'
+  if (key.expires_at && new Date(key.expires_at).getTime() <= Date.now()) return 'expired'
+  return 'published'
+}
+
 const rows = computed(() =>
-  props.addresses.map((address) => ({
-    address,
-    published: props.keys.some((k) => k.address.toLowerCase() === address.toLowerCase()),
-  })),
+  props.addresses.map((address) => {
+    const key = props.keys.find((k) => k.address.toLowerCase() === address.toLowerCase())
+    return { address, status: statusFor(key) }
+  }),
 )
 </script>
 
@@ -22,8 +43,8 @@ const rows = computed(() =>
   <ul v-else class="address-list">
     <li v-for="row in rows" :key="row.address" class="address-row">
       <span class="address">{{ row.address }}</span>
-      <span :class="['badge', row.published ? 'badge--published' : 'badge--unpublished']">
-        {{ row.published ? 'published' : 'no key' }}
+      <span :class="['badge', `badge--${row.status.replace(' ', '-')}`]">
+        {{ statusLabel[row.status] }}
       </span>
     </li>
   </ul>
@@ -73,7 +94,13 @@ const rows = computed(() =>
   color: var(--accent);
 }
 
-.badge--unpublished {
+.badge--revoked,
+.badge--expired {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
+}
+
+.badge--no-key {
   background: transparent;
   color: var(--muted);
   border: 1px solid var(--border);

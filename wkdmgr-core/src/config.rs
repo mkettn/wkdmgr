@@ -94,6 +94,12 @@ pub struct LdapUserDbConfig {
     #[serde(default = "default_mail_attr")]
     pub mail_attr: String,
     pub alias_attr: String,
+    /// Bound applied to the whole connect+bind+search sequence for each
+    /// lookup, so a blackholed directory (packets dropped, a failed-over
+    /// host still holding the VIP) fails fast with the intended `502`
+    /// instead of hanging the request until the OS-level TCP timeout.
+    #[serde(default = "default_ldap_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 fn default_uid_attr() -> String {
@@ -102,6 +108,10 @@ fn default_uid_attr() -> String {
 
 fn default_mail_attr() -> String {
     "mail".to_string()
+}
+
+fn default_ldap_timeout_secs() -> u64 {
+    10
 }
 
 impl UserDbConfig {
@@ -163,6 +173,7 @@ alias_attr: mailAlternateAddress
             UserDbConfig::Ldap(l) => {
                 assert_eq!(l.uri, "ldap://localhost:389");
                 assert_eq!(l.alias_attr, "mailAlternateAddress");
+                assert_eq!(l.timeout_secs, 10, "expected the default timeout");
             }
             _ => panic!("expected ldap"),
         }
