@@ -1,0 +1,29 @@
+Hooks in this directory run, in filename sort order, every time
+wkdmgr-mgmt successfully publishes a key (after it has already been
+written to the SQLite store).
+
+Calling convention
+-------------------
+    <script> <email> <domain>
+
+- argv[1] is the full email address the key was published for.
+- argv[2] is the domain part of that address.
+- The minimized key bytes (the same bytes now stored in the database and
+  served over WKD) are piped to the script's stdin.
+
+Only files in this directory that are both regular files and marked
+executable (any of the owner/group/other execute bits) are run. Files
+without the execute bit -- including this README -- are ignored.
+Scripts run in filename order, so prefix them (01-, 02-, ...) if order
+matters.
+
+Each hook gets a fixed timeout (default 10s, configurable via
+`hook_timeout_secs` in config.yaml). A hook that times out is killed. A
+hook that fails (non-zero exit) or hangs is logged as a warning and does
+not affect the key that was just published -- hooks are a best-effort
+side effect, not part of the transaction.
+
+There are no bundled hooks in v1. This directory is the intended
+extension point for later integrations (for example, feeding a
+mail-encryption gateway's keyring), which wkdmgr's core does not need to
+know anything about.

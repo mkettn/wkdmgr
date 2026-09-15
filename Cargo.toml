@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "wkdmgr-core",
+    "wkdmgr-query",
+    "wkdmgr-mgmt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time", "process"] }
+axum = { version = "0.8", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-openssl"] }
+sha1 = "0.10"
+notify = "6"
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+chrono = { version = "0.4", features = ["clock"] }
+tempfile = "3"
+base64 = "0.22"
