@@ -1,7 +1,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
+use utoipa::OpenApi;
 use wkdmgr_core::config::Config;
-use wkdmgr_mgmt::{build_app, AppState};
+use wkdmgr_mgmt::{build_app, ApiDoc, AppState};
 
 fn config_path() -> std::path::PathBuf {
     std::env::var("WKDMGR_CONFIG")
@@ -11,6 +12,14 @@ fn config_path() -> std::path::PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Dump the OpenAPI spec (the single source of truth the frontend's
+    // TypeScript client is generated from) and exit -- no config, DB, or
+    // socket needed for this.
+    if std::env::args().any(|arg| arg == "--print-openapi") {
+        println!("{}", ApiDoc::openapi().to_pretty_json()?);
+        return Ok(());
+    }
+
     tracing_subscriber::fmt::init();
 
     let cfg = Config::load(config_path())?;

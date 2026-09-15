@@ -18,6 +18,7 @@ serde_yaml = { workspace = true }
 rusqlite = { workspace = true }
 sequoia-openpgp = { workspace = true }
 tower-http = { version = "0.6", features = ["fs"] }
+utoipa = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

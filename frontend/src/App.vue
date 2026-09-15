@@ -1,13 +1,13 @@
-<script setup>
+<script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { getMe, listKeys } from './api.js'
+import { getMe, listKeys, type KeyResponseItem } from './api'
 import AddressList from './components/AddressList.vue'
 import KeyUploadForm from './components/KeyUploadForm.vue'
 import KeyList from './components/KeyList.vue'
 
-const uid = ref(null)
-const addresses = ref([])
-const keys = ref([])
+const uid = ref<string | null>(null)
+const addresses = ref<string[]>([])
+const keys = ref<KeyResponseItem[]>([])
 const loadError = ref('')
 const loading = ref(true)
 
@@ -24,7 +24,7 @@ async function loadAll() {
     addresses.value = me.addresses
     await refreshKeys()
   } catch (err) {
-    loadError.value = err.message || 'failed to load'
+    loadError.value = err instanceof Error ? err.message : 'failed to load'
   } finally {
     loading.value = false
   }

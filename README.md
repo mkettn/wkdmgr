@@ -56,17 +56,48 @@ cargo build --release
 cd frontend
 npm install
 npm run build
-# static bundle at frontend/dist/
+# type-checks (vue-tsc), then builds the static bundle at frontend/dist/
 ```
 
-Run the test suite (unit tests across all crates, plus an end-to-end
+Run the test suite (unit tests across all crates, an end-to-end
 integration test that spins up both binaries against real Unix sockets
 in a temp directory, uploads a key through the mgmt API, and confirms
-the query API serves the correctly minimized key at the right hash):
+the query API serves the correctly minimized key at the right hash, and
+the API-contract drift guard described below):
 
 ```sh
 cargo test --workspace
 ```
+
+## Keeping the API contract in sync
+
+`wkdmgr-mgmt`'s JSON API is implemented once, in Rust, and the frontend
+never hand-writes a second copy of its shape. The Rust handlers and DTOs
+in `wkdmgr-mgmt/src/lib.rs` are annotated with [`utoipa`](https://docs.rs/utoipa)
+to derive an OpenAPI 3.1 spec directly from the real code (`ApiDoc`).
+The frontend's TypeScript client is generated from that spec via
+[`openapi-typescript`](https://openapi-ts.dev/) + [`openapi-fetch`](https://openapi-ts.dev/openapi-fetch/),
+so `frontend/src/api.ts` is fully typed against the actual Rust request
+and response shapes -- there is no second, hand-maintained schema to let
+drift.
+
+After changing anything about the `/api/*` contract (a handler's
+request/response shape, a status code, a new route), regenerate the
+frontend's copy:
+
+```sh
+cd frontend
+npm run generate:api
+# runs `wkdmgr-mgmt --print-openapi` -> frontend/openapi.json,
+# then `openapi-typescript` -> frontend/src/api-types.ts
+```
+
+and commit the regenerated `openapi.json` and `api-types.ts` alongside
+your Rust change. `cargo test --workspace` includes a guard
+(`wkdmgr-mgmt`'s `openapi_spec_is_up_to_date` test) that fails loudly if
+the checked-in `frontend/openapi.json` no longer matches what the
+current Rust code would generate, so a backend change that forgets this
+step doesn't silently ship a stale frontend client.
 
 ## Configuration
 

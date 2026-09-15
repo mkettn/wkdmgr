@@ -1,23 +1,26 @@
-<script setup>
+<script setup lang="ts">
 import { ref } from 'vue'
-import { deleteKey } from '../api.js'
+import { deleteKey } from '../api'
+import type { KeyResponseItem } from '../api'
 
-const props = defineProps({
-  keys: { type: Array, required: true },
-})
-const emit = defineEmits(['deleted'])
+const props = defineProps<{
+  keys: KeyResponseItem[]
+}>()
+const emit = defineEmits<{
+  deleted: []
+}>()
 
-const pendingId = ref(null)
+const pendingId = ref<string | null>(null)
 const errorMessage = ref('')
 
-async function onDelete(id) {
+async function onDelete(id: string) {
   errorMessage.value = ''
   pendingId.value = id
   try {
     await deleteKey(id)
     emit('deleted')
   } catch (err) {
-    errorMessage.value = err.message || 'delete failed'
+    errorMessage.value = err instanceof Error ? err.message : 'delete failed'
   } finally {
     pendingId.value = null
   }

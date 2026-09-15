@@ -1,11 +1,13 @@
-<script setup>
+<script setup lang="ts">
 import { ref } from 'vue'
-import { uploadKey } from '../api.js'
+import { uploadKey } from '../api'
 
-const props = defineProps({
-  addresses: { type: Array, required: true },
-})
-const emit = defineEmits(['uploaded'])
+const props = defineProps<{
+  addresses: string[]
+}>()
+const emit = defineEmits<{
+  uploaded: []
+}>()
 
 const selectedAddress = ref('')
 const keyText = ref('')
@@ -27,7 +29,7 @@ async function onSubmit() {
     keyText.value = ''
     emit('uploaded')
   } catch (err) {
-    errorMessage.value = err.message || 'upload failed'
+    errorMessage.value = err instanceof Error ? err.message : 'upload failed'
   } finally {
     submitting.value = false
   }

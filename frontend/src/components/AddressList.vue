@@ -1,10 +1,11 @@
-<script setup>
+<script setup lang="ts">
 import { computed } from 'vue'
+import type { KeyResponseItem } from '../api'
 
-const props = defineProps({
-  addresses: { type: Array, required: true },
-  keys: { type: Array, required: true },
-})
+const props = defineProps<{
+  addresses: string[]
+  keys: KeyResponseItem[]
+}>()
 
 const rows = computed(() =>
   props.addresses.map((address) => ({

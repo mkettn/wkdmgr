@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use utoipa::{OpenApi, ToSchema};
 use wkdmgr_core::openpgp::KeyError;
 use wkdmgr_core::UserDb;
 
@@ -47,6 +48,19 @@ pub fn build_app(state: AppState, frontend_dist_dir: Option<PathBuf>) -> Router 
     app
 }
 
+/// The single source of truth for the `/api/*` contract. `wkdmgr-mgmt
+/// --print-openapi` dumps this as JSON; the frontend's generated
+/// TypeScript client (`frontend/src/api-types.ts`) is derived from that
+/// output via `openapi-typescript`, so the two implementations cannot
+/// drift silently -- see `openapi_spec_is_up_to_date` in this crate's
+/// integration test for the guard that enforces it.
+#[derive(OpenApi)]
+#[openapi(
+    paths(get_me, list_keys, upload_key, delete_key),
+    components(schemas(MeResponse, KeyResponseItem, UploadRequest, ApiErrorBody))
+)]
+pub struct ApiDoc;
+
 // ---------------------------------------------------------------------
 // Auth extractor
 // ---------------------------------------------------------------------
@@ -76,6 +90,20 @@ impl FromRequestParts<AppState> for AuthenticatedUid {
 // ---------------------------------------------------------------------
 // Error type: JSON body with a fixed `error` code and human `message`.
 // ---------------------------------------------------------------------
+
+/// The JSON body every non-2xx response carries. Exists purely for the
+/// generated OpenAPI schema -- `ApiError::into_response` builds this
+/// shape ad hoc via `serde_json::json!` rather than constructing one of
+/// these, so keep the two in sync by hand if either changes.
+#[derive(Serialize, ToSchema)]
+struct ApiErrorBody {
+    /// A fixed, machine-matchable error code (e.g. `parse_failed`,
+    /// `address_not_owned`, `already_exists`, `no_matching_uid`,
+    /// `not_found`).
+    error: String,
+    /// A human-readable explanation, safe to display to the user.
+    message: String,
+}
 
 pub struct ApiError {
     status: StatusCode,
@@ -164,12 +192,22 @@ impl IntoResponse for ApiError {
 // GET /api/me
 // ---------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct MeResponse {
     uid: String,
     addresses: Vec<String>,
 }
 
+/// Get the authenticated uid and the addresses it's authorized to manage
+#[utoipa::path(
+    get,
+    path = "/api/me",
+    responses(
+        (status = 200, description = "The authenticated uid and its owned addresses", body = MeResponse),
+        (status = 401, description = "Missing SSO identity header", body = ApiErrorBody),
+        (status = 502, description = "UserDb backend unavailable", body = ApiErrorBody),
+    ),
+)]
 async fn get_me(
     State(state): State<AppState>,
     uid: AuthenticatedUid,
@@ -189,7 +227,7 @@ async fn get_me(
 // GET /api/keys
 // ---------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct KeyResponseItem {
     id: String,
     address: String,
@@ -212,6 +250,15 @@ impl From<wkdmgr_core::storage::KeyRecord> for KeyResponseItem {
     }
 }
 
+/// List the authenticated uid's own published keys
+#[utoipa::path(
+    get,
+    path = "/api/keys",
+    responses(
+        (status = 200, description = "Keys owned by the authenticated uid", body = Vec<KeyResponseItem>),
+        (status = 401, description = "Missing SSO identity header", body = ApiErrorBody),
+    ),
+)]
 async fn list_keys(
     State(state): State<AppState>,
     uid: AuthenticatedUid,
@@ -233,12 +280,26 @@ async fn list_keys(
 // POST /api/keys
 // ---------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct UploadRequest {
     address: String,
+    /// ASCII-armored or base64-encoded OpenPGP public key material.
     key: String,
 }
 
+/// Publish a minimized key for one of the authenticated uid's addresses
+#[utoipa::path(
+    post,
+    path = "/api/keys",
+    request_body = UploadRequest,
+    responses(
+        (status = 201, description = "Published", body = KeyResponseItem),
+        (status = 400, description = "parse_failed | no_matching_uid | address_not_owned", body = ApiErrorBody),
+        (status = 401, description = "Missing SSO identity header", body = ApiErrorBody),
+        (status = 409, description = "already_exists -- delete the existing key first", body = ApiErrorBody),
+        (status = 502, description = "UserDb backend unavailable", body = ApiErrorBody),
+    ),
+)]
 async fn upload_key(
     State(state): State<AppState>,
     uid: AuthenticatedUid,
@@ -317,6 +378,19 @@ async fn upload_key(
 // DELETE /api/keys/:id
 // ---------------------------------------------------------------------
 
+/// Revoke (delete) one of the authenticated uid's own published keys
+#[utoipa::path(
+    delete,
+    path = "/api/keys/{id}",
+    params(
+        ("id" = i64, Path, description = "The key's database row id, from GET /api/keys"),
+    ),
+    responses(
+        (status = 204, description = "Revoked"),
+        (status = 401, description = "Missing SSO identity header", body = ApiErrorBody),
+        (status = 404, description = "Not found, or not owned by the authenticated uid", body = ApiErrorBody),
+    ),
+)]
 async fn delete_key(
     State(state): State<AppState>,
     uid: AuthenticatedUid,
