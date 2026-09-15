@@ -80,7 +80,6 @@ allowed_domains:
   - example-2.tld
 
 db_path: /var/lib/wkdmgr/meta.sqlite3
-hooks_dir: /etc/wkdmgr/hooks.d
 sso_header_name: Remote-User
 userdb_config: /etc/wkdmgr/userdb.yaml
 
@@ -91,9 +90,6 @@ query_socket:
 mgmt_socket:
   path: /run/wkdmgr/mgmt.sock
   mode: "0660"
-
-# Optional. Best-effort hook timeout in seconds (default 10).
-hook_timeout_secs: 10
 
 # Optional. If set, wkdmgr-mgmt serves the built frontend bundle
 # (frontend/dist) itself as a fallback route. If unset, serve it from
@@ -261,17 +257,6 @@ shown above. If you pick option 1, add a second `location /` block that
 serves `frontend_dist_dir` as static files and keep the `/api/`
 `location` block proxying to the socket.
 
-## Hooks
-
-`hooks.d/on_key_add/` and `hooks.d/on_key_remove/` are the deferred
-integration point (e.g. for feeding a mail-encryption gateway's
-keyring). They ship empty in this repo aside from a `README` in each
-explaining the exact calling convention. See those files for details;
-in short: every executable script in the relevant directory runs, in
-filename sort order, as `script <email> <domain>` (with the minimized
-key piped to stdin for `on_key_add`), with a timeout, best-effort, after
-the underlying database operation has already succeeded.
-
 ## Storage
 
 A single SQLite database (`db_path`) is the entire persistent state --
@@ -340,8 +325,7 @@ it; `wkdmgr-query`'s `SELECT` simply filters `revoked = 0`.
 - No built-in TLS -- terminate TLS at nginx.
 - No mail-based key-ownership confirmation loop -- `UserDb`-verified
   ownership via the SSO-authenticated uid replaces that.
-- No integration with any mail-encryption gateway -- that's what the
-  hooks mechanism exists to defer.
+- No integration with any mail-encryption gateway.
 - No S/MIME support -- OpenPGP/WKD only.
 - No multi-user administration UI -- each user manages only their own
   addresses.

@@ -4,10 +4,6 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-fn default_hook_timeout_secs() -> u64 {
-    10
-}
-
 fn default_sso_header_name() -> String {
     "Remote-User".to_string()
 }
@@ -37,24 +33,16 @@ impl SocketConfig {
 pub struct Config {
     pub allowed_domains: Vec<String>,
     pub db_path: PathBuf,
-    #[serde(default = "default_hooks_dir")]
-    pub hooks_dir: PathBuf,
     #[serde(default = "default_sso_header_name")]
     pub sso_header_name: String,
     pub userdb_config: PathBuf,
     pub query_socket: SocketConfig,
     pub mgmt_socket: SocketConfig,
-    #[serde(default = "default_hook_timeout_secs")]
-    pub hook_timeout_secs: u64,
     /// Optional: if set, `wkdmgr-mgmt` serves the built frontend static
     /// bundle from this directory as a fallback route (see README for the
     /// alternative of serving it directly from nginx instead).
     #[serde(default)]
     pub frontend_dist_dir: Option<PathBuf>,
-}
-
-fn default_hooks_dir() -> PathBuf {
-    PathBuf::from("/etc/wkdmgr/hooks.d")
 }
 
 impl Config {
@@ -193,7 +181,6 @@ allowed_domains:
   - example-1.tld
   - example-2.tld
 db_path: /var/lib/wkdmgr/meta.sqlite3
-hooks_dir: /etc/wkdmgr/hooks.d
 sso_header_name: Remote-User
 userdb_config: /etc/wkdmgr/userdb.yaml
 query_socket:

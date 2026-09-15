@@ -1,6 +1,5 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use wkdmgr_core::config::Config;
 use wkdmgr_mgmt::{build_app, AppState};
 
@@ -29,17 +28,11 @@ async fn main() -> anyhow::Result<()> {
     let conn = wkdmgr_core::storage::open_writable(&cfg.db_path)?;
     let db = Arc::new(Mutex::new(conn));
 
-    for sub in ["on_key_add", "on_key_remove"] {
-        let _ = std::fs::create_dir_all(cfg.hooks_dir.join(sub));
-    }
-
     let state = AppState {
         db,
         allowed_domains: Arc::new(cfg.allowed_domains.clone()),
         sso_header_name: Arc::new(cfg.sso_header_name.clone()),
         userdb,
-        hooks_dir: Arc::new(cfg.hooks_dir.clone()),
-        hook_timeout: Duration::from_secs(cfg.hook_timeout_secs),
     };
 
     let app = build_app(state, cfg.frontend_dist_dir.clone());

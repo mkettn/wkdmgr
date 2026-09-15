@@ -8,7 +8,6 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use wkdmgr_core::openpgp::KeyError;
 use wkdmgr_core::UserDb;
 
@@ -18,8 +17,6 @@ pub struct AppState {
     pub allowed_domains: Arc<Vec<String>>,
     pub sso_header_name: Arc<String>,
     pub userdb: Arc<dyn UserDb>,
-    pub hooks_dir: Arc<PathBuf>,
-    pub hook_timeout: Duration,
 }
 
 /// Build the `wkdmgr-mgmt` router: the SSO-gated JSON API under `/api`,
@@ -313,15 +310,6 @@ async fn upload_key(
         Err(e) => return Err(ApiError::internal(e.to_string())),
     };
 
-    wkdmgr_core::hooks::run_on_key_add(
-        &state.hooks_dir,
-        &body.address,
-        &domain,
-        &minimized,
-        state.hook_timeout,
-    )
-    .await;
-
     Ok((StatusCode::CREATED, Json(record.into())))
 }
 
@@ -356,16 +344,7 @@ async fn delete_key(
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     match removed {
-        Some(rec) => {
-            wkdmgr_core::hooks::run_on_key_remove(
-                &state.hooks_dir,
-                &rec.address,
-                &rec.domain,
-                state.hook_timeout,
-            )
-            .await;
-            Ok(StatusCode::NO_CONTENT)
-        }
+        Some(_) => Ok(StatusCode::NO_CONTENT),
         None => Err(ApiError::not_found()),
     }
 }

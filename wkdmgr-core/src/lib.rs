@@ -1,5 +1,4 @@
 pub mod config;
-pub mod hooks;
 pub mod openpgp;
 pub mod storage;
 pub mod userdb;

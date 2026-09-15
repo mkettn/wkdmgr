@@ -11,7 +11,6 @@ use sequoia_openpgp::serialize::Serialize as _;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wkdmgr_core::userdb::FlatFileUserDb;
 use wkdmgr_mgmt::{build_app as build_mgmt_app, AppState as MgmtAppState};
@@ -115,7 +114,6 @@ async fn spawn_harness() -> TestHarness {
     let userdb_path = dir.path().join("userdb.yaml");
     let mgmt_socket = dir.path().join("mgmt.sock");
     let query_socket = dir.path().join("query.sock");
-    let hooks_dir = dir.path().join("hooks.d");
 
     tokio::fs::write(
         &userdb_path,
@@ -140,8 +138,6 @@ users:
         allowed_domains: Arc::new(allowed_domains.clone()),
         sso_header_name: Arc::new("Remote-User".to_string()),
         userdb,
-        hooks_dir: Arc::new(hooks_dir),
-        hook_timeout: Duration::from_secs(5),
     };
     let mgmt_app = build_mgmt_app(mgmt_state, None);
     let mgmt_listener = tokio::net::UnixListener::bind(&mgmt_socket).unwrap();
