@@ -109,14 +109,7 @@ struct TestHarness {
 }
 
 async fn spawn_harness() -> TestHarness {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("meta.sqlite3");
-    let userdb_path = dir.path().join("userdb.yaml");
-    let mgmt_socket = dir.path().join("mgmt.sock");
-    let query_socket = dir.path().join("query.sock");
-
-    tokio::fs::write(
-        &userdb_path,
+    spawn_harness_with_userdb(
         r#"
 backend: flatfile
 users:
@@ -126,7 +119,16 @@ users:
 "#,
     )
     .await
-    .unwrap();
+}
+
+async fn spawn_harness_with_userdb(userdb_yaml: &str) -> TestHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("meta.sqlite3");
+    let userdb_path = dir.path().join("userdb.yaml");
+    let mgmt_socket = dir.path().join("mgmt.sock");
+    let query_socket = dir.path().join("query.sock");
+
+    tokio::fs::write(&userdb_path, userdb_yaml).await.unwrap();
 
     let allowed_domains: Vec<String> = vec!["example.com".to_string()];
 
@@ -465,6 +467,212 @@ fn generate_armored_cert_with_uid_revoked(uid_str: &str) -> String {
         writer.finalize().unwrap();
     }
     String::from_utf8(buf).unwrap()
+}
+
+/// Two uids that both currently own the same address (a shared/role
+/// mailbox) must not be able to silently take the address from each
+/// other: the second upload is refused with `already_exists`, not
+/// treated as a reassignment.
+#[tokio::test]
+async fn shared_address_second_owner_upload_is_blocked_not_replaced() {
+    let harness = spawn_harness_with_userdb(
+        r#"
+backend: flatfile
+users:
+  alice:
+    addresses:
+      - shared@example.com
+  bob:
+    addresses:
+      - shared@example.com
+"#,
+    )
+    .await;
+
+    let (alice_armored, _) = generate_armored_cert(&["Alice <shared@example.com>"]);
+    let alice_upload = serde_json::json!({
+        "address": "shared@example.com",
+        "key": alice_armored,
+    })
+    .to_string();
+    let alice_resp = http_request(
+        &harness.mgmt_socket,
+        "POST",
+        "/api/keys",
+        "mgmt.local",
+        &[
+            ("Remote-User", "alice"),
+            ("Content-Type", "application/json"),
+        ],
+        alice_upload.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        alice_resp.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&alice_resp.body)
+    );
+
+    let (bob_armored, _) = generate_armored_cert(&["Bob <shared@example.com>"]);
+    let bob_upload = serde_json::json!({
+        "address": "shared@example.com",
+        "key": bob_armored,
+    })
+    .to_string();
+    let bob_resp = http_request(
+        &harness.mgmt_socket,
+        "POST",
+        "/api/keys",
+        "mgmt.local",
+        &[("Remote-User", "bob"), ("Content-Type", "application/json")],
+        bob_upload.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        bob_resp.status, 409,
+        "bob still owns the address too, so his upload must not silently replace alice's key"
+    );
+    let bob_json: serde_json::Value = serde_json::from_slice(&bob_resp.body).unwrap();
+    assert_eq!(bob_json["error"], "already_exists");
+
+    // Alice's key is still the one served.
+    let (wkd_hash, domain) =
+        wkdmgr_core::wkd_hash::wkd_hash_for_address("shared@example.com").unwrap();
+    assert_eq!(domain, "example.com");
+    let query_resp = http_request(
+        &harness.query_socket,
+        "GET",
+        &format!("/.well-known/openpgpkey/hu/{wkd_hash}"),
+        "example.com",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(query_resp.status, 200);
+    let served = wkdmgr_core::openpgp::parse_cert(&query_resp.body).unwrap();
+    assert_eq!(
+        served.userids().next().unwrap().userid().email().unwrap(),
+        Some("shared@example.com")
+    );
+}
+
+/// When an address is genuinely reassigned -- the old owner's uid no
+/// longer appears in `UserDb` for it, a new uid's does -- the new
+/// owner's upload must replace the stale row instead of 409ing forever.
+#[tokio::test]
+async fn reassigned_address_upload_replaces_stale_owners_row() {
+    let harness = spawn_harness_with_userdb(
+        r#"
+backend: flatfile
+users:
+  alice:
+    addresses:
+      - alice@example.com
+"#,
+    )
+    .await;
+
+    let (alice_armored, _) = generate_armored_cert(&["Alice <alice@example.com>"]);
+    let alice_upload = serde_json::json!({
+        "address": "alice@example.com",
+        "key": alice_armored,
+    })
+    .to_string();
+    let alice_resp = http_request(
+        &harness.mgmt_socket,
+        "POST",
+        "/api/keys",
+        "mgmt.local",
+        &[
+            ("Remote-User", "alice"),
+            ("Content-Type", "application/json"),
+        ],
+        alice_upload.as_bytes(),
+    )
+    .await;
+    assert_eq!(alice_resp.status, 201);
+
+    // Reassign the address: alice no longer owns it, bob does now.
+    let userdb_path = harness.dir.path().join("userdb.yaml");
+    tokio::fs::write(
+        &userdb_path,
+        r#"
+backend: flatfile
+users:
+  bob:
+    addresses:
+      - alice@example.com
+"#,
+    )
+    .await
+    .unwrap();
+    // FlatFileUserDb hot-reloads on file change (see
+    // userdb::flatfile::tests::hot_reloads_on_file_change) via a
+    // filesystem watcher running on its own schedule -- poll `GET
+    // /api/me` for a bounded time instead of a fixed sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let me_resp = http_request(
+            &harness.mgmt_socket,
+            "GET",
+            "/api/me",
+            "mgmt.local",
+            &[("Remote-User", "bob")],
+            b"",
+        )
+        .await;
+        let me_json: serde_json::Value = serde_json::from_slice(&me_resp.body).unwrap();
+        if me_json["addresses"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v == "alice@example.com"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("userdb reload for bob's new address did not happen within timeout");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let (bob_armored, _) = generate_armored_cert(&["Bob <alice@example.com>"]);
+    let bob_upload = serde_json::json!({
+        "address": "alice@example.com",
+        "key": bob_armored,
+    })
+    .to_string();
+    let bob_resp = http_request(
+        &harness.mgmt_socket,
+        "POST",
+        "/api/keys",
+        "mgmt.local",
+        &[("Remote-User", "bob"), ("Content-Type", "application/json")],
+        bob_upload.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        bob_resp.status,
+        201,
+        "bob now owns the address and alice no longer does, so this must replace her stale row: {}",
+        String::from_utf8_lossy(&bob_resp.body)
+    );
+
+    let (wkd_hash, domain) =
+        wkdmgr_core::wkd_hash::wkd_hash_for_address("alice@example.com").unwrap();
+    assert_eq!(domain, "example.com");
+    let query_resp = http_request(
+        &harness.query_socket,
+        "GET",
+        &format!("/.well-known/openpgpkey/hu/{wkd_hash}"),
+        "example.com",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(query_resp.status, 200);
+    let served = wkdmgr_core::openpgp::parse_cert(&query_resp.body).unwrap();
+    let uid = served.userids().next().unwrap();
+    assert!(uid.userid().value().windows(3).any(|w| w == b"Bob"));
 }
 
 /// End-to-end proof for the revocation fix: publishing an

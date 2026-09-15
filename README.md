@@ -425,10 +425,16 @@ new owner couldn't delete their way out either (uid-scoped delete can't
 touch a row it doesn't own).
 
 This replacement only happens when the row on file is owned by a
-*different* uid than the one now verified for that address. Re-uploading
-over your own still-current key is unaffected: that still `409`s and
-still requires an explicit delete first, per the API contract's "don't
-silently overwrite" guarantee.
+*different* uid than the one now verified for that address, **and**
+`UserDb` no longer reports that other uid as an owner of it either --
+i.e. it's a genuine reassignment, not two uids that currently both
+legitimately own a shared/role address. In the shared case the upload
+is refused with `409 already_exists` too (a distinct message from the
+same-uid case), rather than letting whichever uid uploads next silently
+take the address over. Re-uploading over your own still-current key is
+unaffected either way: that still `409`s and still requires an explicit
+delete first, per the API contract's "don't silently overwrite"
+guarantee.
 
 ## Non-goals (v1)
 

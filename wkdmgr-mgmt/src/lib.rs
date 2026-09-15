@@ -157,6 +157,22 @@ impl ApiError {
         )
     }
 
+    /// Same `already_exists` code as `Self::already_exists`, but for the
+    /// case where the *existing* row's uid is not the caller: `UserDb`
+    /// still reports that other uid as an owner of this address too, so
+    /// this is a shared/role address rather than a stale reassignment,
+    /// and the upload is refused rather than silently taking it over.
+    fn already_exists_shared(address: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "already_exists",
+            format!(
+                "a key already exists for {address}, published by another owner who still owns \
+                 it too; ask them to remove it first"
+            ),
+        )
+    }
+
     fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", "not found")
     }
@@ -361,6 +377,41 @@ async fn upload_key(
         wkdmgr_core::openpgp::expiration_time(&cert).map_err(ApiError::from_key_error)?;
 
     let db = state.db.clone();
+    let domain_for_peek = domain.clone();
+    let wkd_hash_for_peek = wkd_hash.clone();
+    let existing_owner = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || {
+            let conn = db.lock().expect("db mutex poisoned");
+            wkdmgr_core::storage::existing_owner(&conn, &domain_for_peek, &wkd_hash_for_peek)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // A row already published under a *different* uid: only replace it if
+    // that uid no longer owns the address per `UserDb` (a genuine
+    // reassignment). If it still does, this is a shared/role address and
+    // the upload is refused with a distinct message rather than silently
+    // taking it over -- see `wkdmgr_core::storage::insert_key`.
+    let replace_existing = match &existing_owner {
+        Some(existing_uid) if existing_uid != &uid.0 => {
+            let still_owns = state
+                .userdb
+                .addresses_for_user(existing_uid)
+                .await
+                .map_err(|e| ApiError::userdb_unavailable(e.to_string()))?
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&body.address));
+            if still_owns {
+                return Err(ApiError::already_exists_shared(&body.address));
+            }
+            true
+        }
+        _ => false,
+    };
+
     let uid_owned = uid.0.clone();
     let address = body.address.clone();
     let domain_owned = domain.clone();
@@ -382,6 +433,7 @@ async fn upload_key(
                 revoked,
                 expires_at,
             },
+            replace_existing,
         )
     })
     .await

@@ -21,6 +21,13 @@ pub struct LdapUserDb {
 
 impl LdapUserDb {
     pub fn new(cfg: LdapUserDbConfig) -> anyhow::Result<Self> {
+        if cfg.timeout_secs == 0 {
+            anyhow::bail!(
+                "ldap.timeout_secs must be greater than zero (0 would make every lookup time \
+                 out immediately)"
+            );
+        }
+
         let bind_password = std::fs::read_to_string(&cfg.bind_password_file)
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -130,6 +137,44 @@ impl UserDb for LdapUserDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LdapUserDbConfig;
+
+    fn cfg_with_timeout(
+        timeout_secs: u64,
+        bind_password_file: std::path::PathBuf,
+    ) -> LdapUserDbConfig {
+        LdapUserDbConfig {
+            uri: "ldap://localhost".to_string(),
+            bind_dn: "cn=admin,dc=example,dc=com".to_string(),
+            bind_password_file,
+            base_dn: "dc=example,dc=com".to_string(),
+            uid_attr: "uid".to_string(),
+            mail_attr: "mail".to_string(),
+            alias_attr: "mailAlternateAddress".to_string(),
+            timeout_secs,
+        }
+    }
+
+    #[test]
+    fn new_rejects_zero_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pw_file = dir.path().join("pw");
+        std::fs::write(&pw_file, "secret\n").unwrap();
+
+        let Err(err) = LdapUserDb::new(cfg_with_timeout(0, pw_file)) else {
+            panic!("expected LdapUserDb::new to reject timeout_secs = 0");
+        };
+        assert!(err.to_string().contains("timeout_secs"));
+    }
+
+    #[test]
+    fn new_accepts_nonzero_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pw_file = dir.path().join("pw");
+        std::fs::write(&pw_file, "secret\n").unwrap();
+
+        assert!(LdapUserDb::new(cfg_with_timeout(10, pw_file)).is_ok());
+    }
 
     #[test]
     fn find_attr_ci_matches_regardless_of_case() {

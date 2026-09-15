@@ -8,6 +8,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
+/// The base schema, as it has always shipped (including `revoked`,
+/// added inline before this file had any migration mechanism). This is
+/// only ever a no-op against a database that already has the table --
+/// see `MIGRATIONS` for anything added since.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS keys (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,17 +23,40 @@ CREATE TABLE IF NOT EXISTS keys (
     key_data    BLOB NOT NULL,
     uploaded_at TEXT NOT NULL,
     revoked     INTEGER NOT NULL DEFAULT 0,
-    expires_at  TEXT,
     UNIQUE(domain, wkd_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_keys_uid ON keys(uid);
 CREATE INDEX IF NOT EXISTS idx_keys_domain_hash ON keys(domain, wkd_hash);
 "#;
 
-/// Fixed-precision RFC3339 (whole seconds, `Z` suffix) so `expires_at`
-/// values and the `now` a lookup compares them against sort correctly as
-/// plain strings -- `DateTime::to_rfc3339()`'s default variable-width
-/// fractional seconds would otherwise make that comparison unreliable.
+/// Migrations applied on top of `SCHEMA`, tracked via `PRAGMA
+/// user_version` so `open_writable` brings an *already-existing*
+/// database up to date. `CREATE TABLE IF NOT EXISTS` only ever runs
+/// against a database that doesn't have the table yet, so adding a
+/// column directly to `SCHEMA` -- as this file used to do -- silently
+/// no-ops on every database that predates it, and every subsequent
+/// query against that column then fails outright.
+///
+/// Append-only from here: add new entries at the end; never edit or
+/// reorder one that has already shipped, since `user_version` records
+/// how many of these have already run.
+const MIGRATIONS: &[&str] = &["ALTER TABLE keys ADD COLUMN expires_at TEXT;"];
+
+fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let current = usize::try_from(current.max(0)).unwrap_or(0);
+    for (i, migration) in MIGRATIONS.iter().enumerate().skip(current) {
+        conn.execute_batch(migration)?;
+        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+    }
+    Ok(())
+}
+
+/// Fixed-precision RFC3339 (whole seconds, `Z` suffix) so timestamp
+/// columns compared or sorted as plain strings behave correctly --
+/// `DateTime::to_rfc3339()`'s default variable-width fractional seconds
+/// (present only when nonzero) would otherwise make same-second values
+/// compare inconsistently.
 fn rfc3339_secs(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -55,8 +82,8 @@ pub struct KeyRecord {
 }
 
 /// Open (creating if necessary) the database for read/write, enable WAL
-/// mode, and ensure the schema exists. Only `wkdmgr-mgmt` should call
-/// this.
+/// mode, and ensure the schema is fully up to date (base schema, then
+/// any pending `MIGRATIONS`). Only `wkdmgr-mgmt` should call this.
 pub fn open_writable(db_path: &Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -66,6 +93,7 @@ pub fn open_writable(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
+    run_migrations(&conn)?;
     Ok(conn)
 }
 
@@ -105,20 +133,47 @@ pub struct NewKey<'a> {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-/// Insert a newly-uploaded, minimized key, or -- if a key is already
-/// published at this `(domain, wkd_hash)` under a *different* uid --
-/// replace it, since a currently-verified owner (the caller has already
-/// checked `new_key.uid` against `UserDb` before calling this) has to
-/// have some way to reclaim an address that was reassigned to them:
-/// without this, the old owner's stale key would keep being served
-/// forever, and the new owner could never publish (`UNIQUE(domain,
-/// wkd_hash)` would 409 them, and uid-scoped delete can't touch a row it
-/// doesn't own either). If the existing row is already owned by
-/// `new_key.uid`, this still fails with `InsertError::Duplicate` --
-/// requiring an explicit delete first for your *own* key keeps the
-/// "don't silently overwrite" guarantee the API contract makes for that
-/// case.
-pub fn insert_key(conn: &mut Connection, new_key: &NewKey) -> Result<KeyRecord, InsertError> {
+/// Who (if anyone) currently owns the row at `(domain, wkd_hash)`. The
+/// caller uses this *before* calling `insert_key` to decide whether a
+/// different existing owner represents a genuine reassignment (that
+/// uid's `UserDb`-reported addresses no longer include this one) or
+/// concurrent/shared ownership (it still does) -- `insert_key` itself
+/// has no access to `UserDb` and can't tell the two apart on its own.
+pub fn existing_owner(
+    conn: &Connection,
+    domain: &str,
+    wkd_hash: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT uid FROM keys WHERE domain = ?1 AND wkd_hash = ?2",
+        params![domain, wkd_hash],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Insert a newly-uploaded, minimized key.
+///
+/// If a key is already published at this `(domain, wkd_hash)` under the
+/// *same* uid, this always fails with `InsertError::Duplicate`:
+/// requiring an explicit delete first for your own key keeps the API
+/// contract's "don't silently overwrite" guarantee.
+///
+/// If it's published under a *different* uid, the caller decides via
+/// `replace_existing` (see `existing_owner`): `true` only when that
+/// other uid has been independently confirmed to no longer own the
+/// address (a genuine reassignment -- the old owner's stale key would
+/// otherwise keep being served forever, and the new owner could never
+/// publish at all, since `UNIQUE(domain, wkd_hash)` would 409 them and
+/// uid-scoped delete can't touch a row it doesn't own either). `false`
+/// -- e.g. a shared/role address two uids currently both legitimately
+/// own -- still 409s, the same as the same-uid case, rather than
+/// silently handing the address to whoever uploads next.
+pub fn insert_key(
+    conn: &mut Connection,
+    new_key: &NewKey,
+    replace_existing: bool,
+) -> Result<KeyRecord, InsertError> {
     let tx = conn.transaction()?;
 
     let existing_uid: Option<String> = tx
@@ -133,18 +188,19 @@ pub fn insert_key(conn: &mut Connection, new_key: &NewKey) -> Result<KeyRecord, 
         Some(ref existing) if existing == new_key.uid => {
             return Err(InsertError::Duplicate);
         }
-        Some(_) => {
-            // Owned by someone else on record: the address has been
-            // reassigned to the caller. Replace, don't 409.
+        Some(_) if replace_existing => {
             tx.execute(
                 "DELETE FROM keys WHERE domain = ?1 AND wkd_hash = ?2",
                 params![new_key.domain, new_key.wkd_hash],
             )?;
         }
+        Some(_) => {
+            return Err(InsertError::Duplicate);
+        }
         None => {}
     }
 
-    let uploaded_at = Utc::now().to_rfc3339();
+    let uploaded_at = rfc3339_secs(Utc::now());
     let expires_at = new_key.expires_at.map(rfc3339_secs);
     tx.execute(
         "INSERT INTO keys (uid, domain, address, wkd_hash, fingerprint, key_data, uploaded_at, revoked, expires_at) \
@@ -233,7 +289,6 @@ pub fn lookup_key_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn new_key<'a>(
         uid: &'a str,
@@ -262,6 +317,7 @@ mod tests {
         let rec = insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
+            false,
         )
         .unwrap();
         assert_eq!(rec.uid, "alice");
@@ -290,22 +346,26 @@ mod tests {
         insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
+            false,
         )
         .unwrap();
 
         let err = insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "EEEE5678", b"other key bytes"),
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, InsertError::Duplicate));
     }
 
-    /// The address-reassignment fix: a different, now-verified uid
-    /// uploading for an address already on file under someone else
-    /// replaces that row instead of 409ing forever.
+    /// The address-reassignment fix: a different uid uploading for an
+    /// address already on file under someone else replaces that row
+    /// when the caller has told `insert_key` to (`replace_existing =
+    /// true`) -- which the mgmt handler only does after confirming via
+    /// `UserDb` that the *old* uid no longer owns the address.
     #[test]
-    fn upload_from_new_owner_replaces_old_owners_row() {
+    fn upload_from_new_owner_replaces_old_owners_row_when_told_to() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("meta.sqlite3");
         let mut conn = open_writable(&db_path).unwrap();
@@ -313,12 +373,14 @@ mod tests {
         let old = insert_key(
             &mut conn,
             &new_key("alice", "role@example.com", "AAAA1111", b"alice's key"),
+            false,
         )
         .unwrap();
 
         let new = insert_key(
             &mut conn,
             &new_key("bob", "role@example.com", "BBBB2222", b"bob's key"),
+            true,
         )
         .unwrap();
         assert_eq!(new.uid, "bob");
@@ -335,6 +397,66 @@ mod tests {
         assert_eq!(data, Some(b"bob's key".to_vec()));
     }
 
+    /// The shared/concurrent-ownership fix: without `replace_existing`,
+    /// a different uid's upload still 409s instead of silently taking
+    /// over the address -- this is what the mgmt handler does when the
+    /// existing row's uid still owns the address per `UserDb` too (a
+    /// role address two people legitimately hold at once), as opposed
+    /// to a genuine reassignment.
+    #[test]
+    fn upload_from_different_owner_without_replace_flag_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+        let mut conn = open_writable(&db_path).unwrap();
+
+        insert_key(
+            &mut conn,
+            &new_key("alice", "support@example.com", "AAAA1111", b"alice's key"),
+            false,
+        )
+        .unwrap();
+
+        let err = insert_key(
+            &mut conn,
+            &new_key("bob", "support@example.com", "BBBB2222", b"bob's key"),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, InsertError::Duplicate));
+
+        // Alice's row is untouched.
+        let alices_keys = list_keys_for_uid(&conn, "alice").unwrap();
+        assert_eq!(alices_keys.len(), 1);
+        assert_eq!(alices_keys[0].fingerprint, "AAAA1111");
+        assert!(list_keys_for_uid(&conn, "bob").unwrap().is_empty());
+        let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
+        assert_eq!(data, Some(b"alice's key".to_vec()));
+    }
+
+    #[test]
+    fn existing_owner_reports_current_uid_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+        let mut conn = open_writable(&db_path).unwrap();
+
+        assert_eq!(
+            existing_owner(&conn, "example.com", "somehash").unwrap(),
+            None
+        );
+
+        insert_key(
+            &mut conn,
+            &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            existing_owner(&conn, "example.com", "somehash").unwrap(),
+            Some("alice".to_string())
+        );
+    }
+
     #[test]
     fn query_binary_reads_via_readonly_handle() {
         let dir = tempfile::tempdir().unwrap();
@@ -344,6 +466,7 @@ mod tests {
             insert_key(
                 &mut conn,
                 &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
+                false,
             )
             .unwrap();
         }
@@ -369,7 +492,7 @@ mod tests {
             b"revoked key bytes",
         );
         key.revoked = true;
-        let rec = insert_key(&mut conn, &key).unwrap();
+        let rec = insert_key(&mut conn, &key, false).unwrap();
         assert!(rec.revoked);
 
         // Still visible to its owner (so they can see/manage it)...
@@ -395,7 +518,7 @@ mod tests {
             b"expired key bytes",
         );
         key.expires_at = Some(Utc::now() - chrono::Duration::days(1));
-        let rec = insert_key(&mut conn, &key).unwrap();
+        let rec = insert_key(&mut conn, &key, false).unwrap();
         assert!(rec.expires_at.is_some());
 
         assert_eq!(list_keys_for_uid(&conn, "alice").unwrap().len(), 1);
@@ -411,7 +534,7 @@ mod tests {
 
         let mut key = new_key("alice", "alice@example.com", "ABCD1234", b"live key bytes");
         key.expires_at = Some(Utc::now() + chrono::Duration::days(365));
-        insert_key(&mut conn, &key).unwrap();
+        insert_key(&mut conn, &key, false).unwrap();
 
         let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
         assert_eq!(data, Some(b"live key bytes".to_vec()));
@@ -420,8 +543,67 @@ mod tests {
     #[test]
     fn rfc3339_secs_sorts_consistently() {
         let earlier = Utc::now();
-        std::thread::sleep(Duration::from_millis(1100));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let later = Utc::now();
         assert!(rfc3339_secs(earlier) < rfc3339_secs(later));
+    }
+
+    /// The migration-on-open fix: a database built against the schema
+    /// as it shipped before `expires_at` existed (has `revoked` inline,
+    /// no migration mechanism ever ran) must come out fully usable after
+    /// `open_writable`, not merely open successfully and then fail every
+    /// subsequent query with "no such column: expires_at".
+    #[test]
+    fn open_writable_migrates_a_pre_expires_at_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE keys (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid         TEXT NOT NULL,
+                    domain      TEXT NOT NULL,
+                    address     TEXT NOT NULL,
+                    wkd_hash    TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    key_data    BLOB NOT NULL,
+                    uploaded_at TEXT NOT NULL,
+                    revoked     INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(domain, wkd_hash)
+                );",
+            )
+            .unwrap();
+        }
+
+        let mut conn = open_writable(&db_path).unwrap();
+        let rec = insert_key(
+            &mut conn,
+            &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(rec.expires_at, None);
+        assert_eq!(list_keys_for_uid(&conn, "alice").unwrap().len(), 1);
+        let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
+        assert_eq!(data, Some(b"key bytes".to_vec()));
+    }
+
+    #[test]
+    fn open_writable_is_idempotent_across_repeated_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+
+        open_writable(&db_path).unwrap();
+        // Re-running migrations against an already-migrated database
+        // must not error (e.g. "duplicate column").
+        let mut conn = open_writable(&db_path).unwrap();
+        insert_key(
+            &mut conn,
+            &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
+            false,
+        )
+        .unwrap();
     }
 }
