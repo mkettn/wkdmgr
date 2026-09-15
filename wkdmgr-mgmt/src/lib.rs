@@ -199,6 +199,7 @@ struct KeyResponseItem {
     domain: String,
     fingerprint: String,
     uploaded_at: String,
+    revoked: bool,
 }
 
 impl From<wkdmgr_core::storage::KeyRecord> for KeyResponseItem {
@@ -209,6 +210,7 @@ impl From<wkdmgr_core::storage::KeyRecord> for KeyResponseItem {
             domain: r.domain,
             fingerprint: r.fingerprint,
             uploaded_at: r.uploaded_at,
+            revoked: r.revoked,
         }
     }
 }
@@ -274,6 +276,10 @@ async fn upload_key(
     let minimized = wkdmgr_core::openpgp::minimize_for_address(&cert, &body.address)
         .map_err(ApiError::from_key_error)?;
     let fingerprint = wkdmgr_core::openpgp::fingerprint_hex(&cert);
+    // Computed once here and cached in the `revoked` column: this is the
+    // only place revocation status can change (a fresh upload), so
+    // wkdmgr-query never needs to re-parse the blob on every lookup.
+    let revoked = wkdmgr_core::openpgp::is_revoked(&minimized);
 
     let db = state.db.clone();
     let uid_owned = uid.0.clone();
@@ -293,6 +299,7 @@ async fn upload_key(
             &wkd_hash_owned,
             &fingerprint_owned,
             &minimized_for_insert,
+            revoked,
         )
     })
     .await

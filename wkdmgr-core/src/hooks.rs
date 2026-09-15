@@ -105,23 +105,32 @@ async fn run_one_hook(
         }
     };
 
-    if let Some(payload) = stdin_payload {
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(payload).await {
-                tracing::warn!("failed writing stdin to hook {}: {e}", script.display());
-            }
-            // Drop to close the pipe so the script sees EOF.
-            drop(stdin);
-        }
-    }
+    // Take the pipe handles up front (each a brief `&mut child` borrow),
+    // then run everything -- including the stdin write -- concurrently
+    // inside the single future the timeout below guards. Writing stdin
+    // *before* entering the guarded wait (as a prior version of this
+    // function did) left the write unbounded: once a payload exceeds the
+    // pipe buffer (~64 KiB on Linux), `write_all` blocks until the child
+    // drains it, and a child that never reads stdin never lets that
+    // await return -- so the timeout never even started counting.
+    let mut stdin_pipe = child.stdin.take();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
 
     let wait_and_collect = async {
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
         let mut stdout_buf = Vec::new();
         let mut stderr_buf = Vec::new();
-        let (status, _, _) = tokio::join!(
+        let (status, _, _, _) = tokio::join!(
             child.wait(),
+            async {
+                if let (Some(payload), Some(mut stdin)) = (stdin_payload, stdin_pipe.take()) {
+                    if let Err(e) = stdin.write_all(payload).await {
+                        tracing::warn!("failed writing stdin to hook {}: {e}", script.display());
+                    }
+                    // Drop to close the pipe so the script sees EOF.
+                    drop(stdin);
+                }
+            },
             async {
                 if let Some(s) = stdout_pipe.as_mut() {
                     let _ = s.read_to_end(&mut stdout_buf).await;
@@ -272,5 +281,36 @@ mod tests {
         )
         .await;
         assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    /// Regression test for the stdin write being outside the timeout
+    /// guard: a hook that never reads stdin, given a payload larger than
+    /// the pipe buffer (~64 KiB on Linux), must still be bounded by the
+    /// timeout rather than hanging on `write_all`.
+    #[tokio::test]
+    async fn timeout_bounds_stdin_write_to_a_hook_that_never_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_dir = dir.path().join("hooks.d");
+        let add_dir = hooks_dir.join("on_key_add");
+        tokio::fs::create_dir_all(&add_dir).await.unwrap();
+        // Never touches stdin, so a pipe-buffer-exceeding write blocks
+        // until this process exits -- 60s, well past the timeout below.
+        write_script(&add_dir, "01-ignore-stdin.sh", "#!/bin/sh\nsleep 60\n").await;
+
+        let large_payload = vec![0u8; 4 * 1024 * 1024]; // 4 MiB > 64 KiB pipe buffer
+
+        let start = std::time::Instant::now();
+        run_on_key_add(
+            &hooks_dir,
+            "alice@example.com",
+            "example.com",
+            &large_payload,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "stdin write to a non-reading hook must be bounded by the timeout, not by the hook's own runtime"
+        );
     }
 }

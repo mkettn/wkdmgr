@@ -280,6 +280,61 @@ WAL mode (set once at startup); `wkdmgr-query` opens the same file
 strictly read-only and never writes to it. Back it up like you would any
 real datastore.
 
+## Design decision: minimization strips third-party certifications
+
+Per the WKD spec's own security considerations, a published key contains
+*only* the requested address's User ID, its own self-signature, the
+primary key, and subkeys with their binding signatures -- no other User
+IDs, and no certifications made by other keys. `wkdmgr-core`'s
+minimization step enforces this as a hard invariant (see its unit
+tests).
+
+This is a deliberate trade-off, not an oversight, and it cuts both ways:
+
+- **Why strip them**: a certification is itself a signature by some
+  other key over "I vouch that this UID belongs to this key" --
+  publishing all of them over an unauthenticated HTTPS GET would let
+  anyone enumerate who has certified a given address, leaking a slice of
+  the social graph to any passive observer of WKD traffic.
+- **What it costs**: a WKD lookup can only ever establish
+  trust-on-first-use (TOFU). It cannot let a verifier confirm a fetched
+  key through an existing trust path, since no third-party signatures
+  survive the round trip.
+
+If your deployment wants an in-org trust path to survive WKD lookups
+without publishing the full social graph, the accepted middle ground is
+retaining certifications only from a small, configured set of trusted
+issuers (e.g. your organization's own CA key) -- that's not implemented
+here and would be a deliberate, separate feature, not a change to what
+minimization does by default.
+
+One thing minimization does *not* strip: self-revocation signatures (on
+the primary key, the target User ID, or a subkey) are preserved, and
+`wkdmgr-query` checks them before serving a key -- see the next section.
+
+## Revocation
+
+A key that is revoked -- its primary key, or its sole retained User ID
+after minimization -- is never served: `wkdmgr-query`'s response is the
+same bare `404` as "no key published for this address", so revocation
+status is never leaked either.
+
+Publishing a revocation works through the existing upload contract, no
+separate "revoke" endpoint: `DELETE` the current row, then `POST` the
+same cert with the revocation merged in (`gpg --gen-revoke` then
+`--import`, or your client's equivalent, followed by re-exporting).
+Uploading an already-revoked cert is accepted -- ownership/validity
+checks don't reject a revoked User ID, since rejecting it would make it
+impossible for an owner to ever publish their own revocation.
+
+Revocation status is computed once at upload time (from the minimized
+bytes that are about to be stored) and cached in the `keys.revoked`
+column, rather than re-parsed on every WKD lookup: in this system, the
+only way revocation status can change at all is a fresh upload, so
+there's nothing to recompute in between. The row stays visible (marked
+`revoked: true`) in `GET /api/keys` so an owner can still see and manage
+it; `wkdmgr-query`'s `SELECT` simply filters `revoked = 0`.
+
 ## Non-goals (v1)
 
 - No built-in TLS -- terminate TLS at nginx.

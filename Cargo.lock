@@ -2644,6 +2644,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "rusqlite",
  "serde",
  "serde_yaml",
  "tempfile",

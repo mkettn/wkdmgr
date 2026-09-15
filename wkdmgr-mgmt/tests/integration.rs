@@ -130,14 +130,14 @@ users:
     .await
     .unwrap();
 
-    let allowed_domains = Arc::new(vec!["example.com".to_string()]);
+    let allowed_domains: Vec<String> = vec!["example.com".to_string()];
 
     // --- mgmt ---
     let userdb = Arc::new(FlatFileUserDb::load(userdb_path).unwrap());
     let conn = wkdmgr_core::storage::open_writable(&db_path).unwrap();
     let mgmt_state = MgmtAppState {
         db: Arc::new(Mutex::new(conn)),
-        allowed_domains: allowed_domains.clone(),
+        allowed_domains: Arc::new(allowed_domains.clone()),
         sso_header_name: Arc::new("Remote-User".to_string()),
         userdb,
         hooks_dir: Arc::new(hooks_dir),
@@ -150,10 +150,7 @@ users:
     });
 
     // --- query ---
-    let query_state = QueryAppState {
-        db_path: Arc::new(db_path.clone()),
-        allowed_domains,
-    };
+    let query_state = QueryAppState::new(db_path.clone(), allowed_domains);
     let query_app = build_query_app(query_state);
     let query_listener = tokio::net::UnixListener::bind(&query_socket).unwrap();
     let query_task = tokio::spawn(async move {
@@ -424,4 +421,121 @@ async fn end_to_end_upload_then_query_direct_and_advanced() {
     )
     .await;
     assert_eq!(after_delete_resp.status, 404);
+}
+
+/// Generate an armored cert for `uid_str` whose sole User ID has
+/// already been revoked (a self-revocation merged into the same cert,
+/// the way a real client would produce and publish one).
+fn generate_armored_cert_with_uid_revoked(uid_str: &str) -> String {
+    use sequoia_openpgp::packet::signature::SignatureBuilder;
+    use sequoia_openpgp::packet::{Packet, UserID};
+    use sequoia_openpgp::types::{ReasonForRevocation, SignatureType};
+
+    let uid: UserID = uid_str.into();
+    let (cert, _revocation) = CertBuilder::new()
+        .add_signing_subkey()
+        .add_userid(uid_str)
+        .generate()
+        .unwrap();
+
+    let mut signer = cert
+        .primary_key()
+        .key()
+        .clone()
+        .parts_into_secret()
+        .unwrap()
+        .into_keypair()
+        .unwrap();
+    let target = cert.userids().find(|u| u.userid() == &uid).unwrap();
+    let uid_revocation = target
+        .userid()
+        .bind(
+            &mut signer,
+            &cert,
+            SignatureBuilder::new(SignatureType::CertificationRevocation)
+                .set_reason_for_revocation(ReasonForRevocation::UIDRetired, b"testing")
+                .unwrap(),
+        )
+        .unwrap();
+    let revoked_cert = cert
+        .insert_packets(vec![Packet::from(uid_revocation)])
+        .unwrap()
+        .0;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = armor::Writer::new(&mut buf, armor::Kind::PublicKey).unwrap();
+        revoked_cert.serialize(&mut writer).unwrap();
+        writer.finalize().unwrap();
+    }
+    String::from_utf8(buf).unwrap()
+}
+
+/// End-to-end proof for the revocation fix: publishing an
+/// already-revoked cert must succeed (an owner has to be able to push
+/// their own revocation through this API), but the query socket must
+/// never actually serve it -- same 404 as if no key existed at all.
+#[tokio::test]
+async fn revoked_key_upload_succeeds_but_query_never_serves_it() {
+    let harness = spawn_harness().await;
+    let armored = generate_armored_cert_with_uid_revoked("Alice <alice@example.com>");
+
+    let upload_body = serde_json::json!({
+        "address": "alice@example.com",
+        "key": armored,
+    })
+    .to_string();
+
+    let resp = http_request(
+        &harness.mgmt_socket,
+        "POST",
+        "/api/keys",
+        "mgmt.local",
+        &[
+            ("Remote-User", "alice"),
+            ("Content-Type", "application/json"),
+        ],
+        upload_body.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        resp.status,
+        201,
+        "publishing an owner's own revocation must succeed: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    let upload_json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(upload_json["revoked"], true);
+
+    // The row is still visible to its owner in /api/keys, marked revoked...
+    let list_resp = http_request(
+        &harness.mgmt_socket,
+        "GET",
+        "/api/keys",
+        "mgmt.local",
+        &[("Remote-User", "alice")],
+        b"",
+    )
+    .await;
+    let list_json: serde_json::Value = serde_json::from_slice(&list_resp.body).unwrap();
+    assert_eq!(list_json[0]["revoked"], true);
+
+    // ...but wkdmgr-query never serves it: same 404 as "no key published".
+    let (wkd_hash, domain) =
+        wkdmgr_core::wkd_hash::wkd_hash_for_address("alice@example.com").unwrap();
+    assert_eq!(domain, "example.com");
+    let direct_path = format!("/.well-known/openpgpkey/hu/{wkd_hash}");
+    let query_resp = http_request(
+        &harness.query_socket,
+        "GET",
+        &direct_path,
+        "example.com",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        query_resp.status, 404,
+        "a revoked key must never be served over WKD"
+    );
 }

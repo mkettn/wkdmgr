@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS keys (
     fingerprint TEXT NOT NULL,
     key_data    BLOB NOT NULL,
     uploaded_at TEXT NOT NULL,
+    revoked     INTEGER NOT NULL DEFAULT 0,
     UNIQUE(domain, wkd_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_keys_uid ON keys(uid);
@@ -31,6 +32,10 @@ pub struct KeyRecord {
     pub domain: String,
     pub fingerprint: String,
     pub uploaded_at: String,
+    /// Whether the stored (minimized) key was already revoked -- primary
+    /// key or its sole retained User ID -- at the time it was uploaded.
+    /// `wkdmgr-query` never serves a row with `revoked = true`.
+    pub revoked: bool,
 }
 
 /// Open (creating if necessary) the database for read/write, enable WAL
@@ -68,6 +73,14 @@ pub enum InsertError {
 /// Insert a newly-uploaded, minimized key. Returns the new row id.
 /// Fails with `InsertError::Duplicate` if `UNIQUE(domain, wkd_hash)` is
 /// violated (i.e. a key is already published for this address).
+///
+/// `revoked` is computed by the caller (see
+/// `wkdmgr_core::openpgp::is_revoked`) from the minimized `key_data`
+/// itself at upload time. Because the only way revocation status can
+/// change in this system is a fresh upload (delete-then-republish, per
+/// the API contract), computing and caching it once here -- rather than
+/// re-parsing on every lookup -- is both correct and cheap.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_key(
     conn: &Connection,
     uid: &str,
@@ -76,11 +89,12 @@ pub fn insert_key(
     wkd_hash: &str,
     fingerprint: &str,
     key_data: &[u8],
+    revoked: bool,
 ) -> Result<KeyRecord, InsertError> {
     let uploaded_at = chrono::Utc::now().to_rfc3339();
     let result = conn.execute(
-        "INSERT INTO keys (uid, domain, address, wkd_hash, fingerprint, key_data, uploaded_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO keys (uid, domain, address, wkd_hash, fingerprint, key_data, uploaded_at, revoked) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             uid,
             domain,
@@ -88,7 +102,8 @@ pub fn insert_key(
             wkd_hash,
             fingerprint,
             key_data,
-            uploaded_at
+            uploaded_at,
+            revoked,
         ],
     );
     match result {
@@ -99,6 +114,7 @@ pub fn insert_key(
             domain: domain.to_string(),
             fingerprint: fingerprint.to_string(),
             uploaded_at,
+            revoked,
         }),
         Err(rusqlite::Error::SqliteFailure(e, _))
             if e.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -112,7 +128,7 @@ pub fn insert_key(
 /// List all keys owned by `uid`, most recently uploaded first.
 pub fn list_keys_for_uid(conn: &Connection, uid: &str) -> rusqlite::Result<Vec<KeyRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, uid, address, domain, fingerprint, uploaded_at \
+        "SELECT id, uid, address, domain, fingerprint, uploaded_at, revoked \
          FROM keys WHERE uid = ?1 ORDER BY uploaded_at DESC",
     )?;
     let rows = stmt.query_map(params![uid], |row| {
@@ -123,6 +139,7 @@ pub fn list_keys_for_uid(conn: &Connection, uid: &str) -> rusqlite::Result<Vec<K
             domain: row.get(3)?,
             fingerprint: row.get(4)?,
             uploaded_at: row.get(5)?,
+            revoked: row.get(6)?,
         })
     })?;
     rows.collect()
@@ -141,14 +158,17 @@ pub fn delete_key_for_uid(conn: &Connection, id: i64, uid: &str) -> rusqlite::Re
 }
 
 /// Look up the raw minimized key bytes for a WKD request. Used only by
-/// `wkdmgr-query`.
+/// `wkdmgr-query`. A row marked `revoked` is never returned -- the
+/// lookup behaves exactly as if no key were published for that address,
+/// so a revoked key and an address with no key are indistinguishable on
+/// the wire.
 pub fn lookup_key_data(
     conn: &Connection,
     domain: &str,
     wkd_hash: &str,
 ) -> rusqlite::Result<Option<Vec<u8>>> {
     conn.query_row(
-        "SELECT key_data FROM keys WHERE domain = ?1 AND wkd_hash = ?2",
+        "SELECT key_data FROM keys WHERE domain = ?1 AND wkd_hash = ?2 AND revoked = 0",
         params![domain, wkd_hash],
         |row| row.get(0),
     )
@@ -173,12 +193,15 @@ mod tests {
             "somehash",
             "ABCD1234",
             b"key bytes",
+            false,
         )
         .unwrap();
         assert_eq!(rec.uid, "alice");
+        assert!(!rec.revoked);
 
         let keys = list_keys_for_uid(&conn, "alice").unwrap();
         assert_eq!(keys.len(), 1);
+        assert!(!keys[0].revoked);
 
         let other = list_keys_for_uid(&conn, "bob").unwrap();
         assert!(other.is_empty());
@@ -203,6 +226,7 @@ mod tests {
             "somehash",
             "ABCD1234",
             b"key bytes",
+            false,
         )
         .unwrap();
 
@@ -214,6 +238,7 @@ mod tests {
             "somehash",
             "EEEE5678",
             b"other key bytes",
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, InsertError::Duplicate));
@@ -233,6 +258,7 @@ mod tests {
                 "somehash",
                 "ABCD1234",
                 b"key bytes",
+                false,
             )
             .unwrap();
         }
@@ -243,5 +269,34 @@ mod tests {
 
         let missing = lookup_key_data(&ro, "example.com", "nope").unwrap();
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn revoked_row_is_never_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+        let conn = open_writable(&db_path).unwrap();
+
+        let rec = insert_key(
+            &conn,
+            "alice",
+            "example.com",
+            "alice@example.com",
+            "somehash",
+            "ABCD1234",
+            b"revoked key bytes",
+            true,
+        )
+        .unwrap();
+        assert!(rec.revoked);
+
+        // Still visible to its owner (so they can see/manage it)...
+        let keys = list_keys_for_uid(&conn, "alice").unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].revoked);
+
+        // ...but never served over WKD: same as "no key published".
+        let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
+        assert_eq!(data, None);
     }
 }

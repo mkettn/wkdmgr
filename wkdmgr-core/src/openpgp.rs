@@ -6,6 +6,7 @@ use sequoia_openpgp::packet::Packet;
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::Serialize as _;
+use sequoia_openpgp::types::RevocationStatus;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -29,12 +30,26 @@ pub fn parse_cert(bytes: &[u8]) -> Result<Cert, KeyError> {
 /// contract's `key` field).
 pub fn parse_key_material(input: &str) -> Result<Cert, KeyError> {
     let trimmed = input.trim();
-    if let Ok(cert) = Cert::from_bytes(trimmed.as_bytes()) {
-        return Ok(cert);
+    let looks_armored = trimmed.starts_with("-----BEGIN PGP");
+
+    match Cert::from_bytes(trimmed.as_bytes()) {
+        Ok(cert) => return Ok(cert),
+        // If it's clearly meant to be armor, report *that* parse error
+        // rather than falling through to a misleading "neither armor nor
+        // base64" message that sends people looking in the wrong place.
+        Err(e) if looks_armored => {
+            return Err(KeyError::ParseFailed(format!("invalid OpenPGP armor: {e}")))
+        }
+        Err(_) => {}
     }
+
     use base64::Engine;
+    // `gpg --export ... | base64` line-wraps at 76 columns by default;
+    // strip all whitespace (not just newlines) before decoding so the
+    // most obvious way to produce this input actually works.
+    let stripped: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(trimmed)
+        .decode(&stripped)
         .map_err(|e| {
             KeyError::ParseFailed(format!(
                 "key is neither valid OpenPGP armor nor valid base64: {e}"
@@ -81,6 +96,16 @@ pub fn fingerprint_hex(cert: &Cert) -> String {
 /// self-signature, and subkeys with their valid binding signatures. No
 /// other User IDs and no third-party certifications are included.
 ///
+/// Self-revocation signatures on the primary key, the target User ID,
+/// and each subkey *are* retained (they aren't third-party
+/// certifications, and dropping them would make it impossible to ever
+/// publish a revocation through this API -- a revoked cert has to
+/// survive minimization for `is_revoked` to see it later). Matching
+/// happens against the raw, unvalidated User ID list so that an
+/// already-revoked address can still be found and minimized: an owner
+/// republishing their own revocation is exactly the case this needs to
+/// support, not reject.
+///
 /// Because the packets are rebuilt from the `PublicParts` view of each
 /// key exclusively, the result can never carry secret key material even
 /// if the input did.
@@ -91,7 +116,12 @@ pub fn minimize_for_address(cert: &Cert, address: &str) -> Result<Vec<u8>, KeyEr
         .map_err(|e| KeyError::InvalidPrimaryKey(e.to_string()))?;
 
     let mut packets: Vec<Packet> = Vec::new();
-    packets.push(Packet::from(valid_cert.primary_key().key().clone()));
+
+    let primary = valid_cert.primary_key();
+    packets.push(Packet::from(primary.key().clone()));
+    for revocation in primary.self_revocations() {
+        packets.push(Packet::from(revocation.clone()));
+    }
 
     let target = valid_cert
         .userids()
@@ -99,10 +129,16 @@ pub fn minimize_for_address(cert: &Cert, address: &str) -> Result<Vec<u8>, KeyEr
         .ok_or_else(|| KeyError::NoMatchingUserId(address.to_string()))?;
     packets.push(Packet::from(target.userid().clone()));
     packets.push(Packet::from(target.binding_signature().clone()));
+    for revocation in target.self_revocations() {
+        packets.push(Packet::from(revocation.clone()));
+    }
 
     for ka in valid_cert.keys().subkeys() {
         packets.push(Packet::from(ka.key().clone()));
         packets.push(Packet::from(ka.binding_signature().clone()));
+        for revocation in ka.self_revocations() {
+            packets.push(Packet::from(revocation.clone()));
+        }
     }
 
     let minimized = Cert::from_packets(packets.into_iter())
@@ -113,6 +149,39 @@ pub fn minimize_for_address(cert: &Cert, address: &str) -> Result<Vec<u8>, KeyEr
         .serialize(&mut buf)
         .map_err(|e| KeyError::ParseFailed(format!("failed to serialize minimized cert: {e}")))?;
     Ok(buf)
+}
+
+/// Whether a stored (minimized) key is effectively revoked: either the
+/// primary key itself is revoked, or its sole retained User ID is.
+/// Called once at upload time; the result is cached in the `revoked`
+/// column (see `wkdmgr_core::storage`) rather than re-parsed on every
+/// WKD lookup, since in this system revocation status only ever changes
+/// via a fresh upload.
+///
+/// Fails closed: bytes that don't even parse are treated as revoked
+/// (never served) rather than silently passed through, since a
+/// minimized blob that this function can't parse indicates something
+/// has gone wrong with data this service itself produced.
+pub fn is_revoked(cert_bytes: &[u8]) -> bool {
+    let policy = StandardPolicy::new();
+    let cert = match Cert::from_bytes(cert_bytes) {
+        Ok(cert) => cert,
+        Err(_) => return true,
+    };
+
+    if matches!(
+        cert.revocation_status(&policy, None),
+        RevocationStatus::Revoked(_)
+    ) {
+        return true;
+    }
+
+    cert.userids().any(|ua| {
+        matches!(
+            ua.revocation_status(&policy, None),
+            RevocationStatus::Revoked(_)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -205,5 +274,134 @@ mod tests {
         let cert = cert_with_uids(&["Alice <alice@example.com>"]);
         let err = minimize_for_address(&cert, "nobody@example.com").unwrap_err();
         assert!(matches!(err, KeyError::NoMatchingUserId(_)));
+    }
+
+    fn revoke_userid(cert: &Cert, uid_str: &str) -> Cert {
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::packet::UserID;
+        use sequoia_openpgp::types::{ReasonForRevocation, SignatureType};
+
+        let uid: UserID = uid_str.into();
+        let mut signer = cert
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let target = cert.userids().find(|ua| ua.userid() == &uid).unwrap();
+        let revocation = target
+            .userid()
+            .bind(
+                &mut signer,
+                cert,
+                SignatureBuilder::new(SignatureType::CertificationRevocation)
+                    .set_reason_for_revocation(ReasonForRevocation::UIDRetired, b"testing")
+                    .unwrap(),
+            )
+            .unwrap();
+        cert.clone()
+            .insert_packets(vec![Packet::from(revocation)])
+            .unwrap()
+            .0
+    }
+
+    fn revoke_primary_key(cert: &Cert) -> Cert {
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::types::{ReasonForRevocation, SignatureType};
+
+        let mut signer = cert
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let revocation = SignatureBuilder::new(SignatureType::KeyRevocation)
+            .set_reason_for_revocation(ReasonForRevocation::KeyCompromised, b"testing")
+            .unwrap()
+            .sign_direct_key(&mut signer, None)
+            .unwrap();
+        cert.clone()
+            .insert_packets(vec![Packet::from(revocation)])
+            .unwrap()
+            .0
+    }
+
+    /// A user must be able to publish their own revocation: uploading a
+    /// cert whose only UID has since been revoked must still find and
+    /// minimize that UID (not reject it as "no matching UID"), and the
+    /// revocation signature must survive minimization so it's visible
+    /// after the round trip.
+    #[test]
+    fn minimization_preserves_uid_revocation() {
+        let cert = cert_with_uids(&["Alice <alice@example.com>"]);
+        let revoked_cert = revoke_userid(&cert, "Alice <alice@example.com>");
+
+        // Ownership/validity check still accepts it: revocation must not
+        // block the very upload that publishes it.
+        assert!(validate_for_address(&revoked_cert, "alice@example.com").is_ok());
+
+        let minimized_bytes = minimize_for_address(&revoked_cert, "alice@example.com").unwrap();
+        assert!(is_revoked(&minimized_bytes));
+
+        let minimized = parse_cert(&minimized_bytes).unwrap();
+        assert_eq!(minimized.userids().count(), 1);
+    }
+
+    #[test]
+    fn minimization_preserves_primary_key_revocation() {
+        let cert = cert_with_uids(&["Alice <alice@example.com>"]);
+        let revoked_cert = revoke_primary_key(&cert);
+
+        let minimized_bytes = minimize_for_address(&revoked_cert, "alice@example.com").unwrap();
+        assert!(is_revoked(&minimized_bytes));
+    }
+
+    #[test]
+    fn is_revoked_false_for_live_key() {
+        let cert = cert_with_uids(&["Alice <alice@example.com>"]);
+        let minimized_bytes = minimize_for_address(&cert, "alice@example.com").unwrap();
+        assert!(!is_revoked(&minimized_bytes));
+    }
+
+    #[test]
+    fn is_revoked_true_for_unparseable_bytes() {
+        assert!(is_revoked(b"not a cert"));
+    }
+
+    #[test]
+    fn parse_key_material_accepts_line_wrapped_base64() {
+        let cert = cert_with_uids(&["Alice <alice@example.com>"]);
+        let mut buf = Vec::new();
+        cert.serialize(&mut buf).unwrap();
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+        // Simulate `base64`'s default 76-column wrap.
+        let wrapped: String = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed = parse_key_material(&wrapped).unwrap();
+        assert_eq!(parsed.fingerprint(), cert.fingerprint());
+    }
+
+    #[test]
+    fn parse_key_material_reports_armor_error_for_corrupt_armor() {
+        let broken_armor = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnot valid base64 content!!\n-----END PGP PUBLIC KEY BLOCK-----\n";
+        let err = parse_key_material(broken_armor).unwrap_err();
+        let KeyError::ParseFailed(message) = err else {
+            panic!("expected ParseFailed");
+        };
+        assert!(
+            message.contains("armor"),
+            "expected an armor-specific error, got: {message}"
+        );
     }
 }

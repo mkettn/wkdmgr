@@ -1,5 +1,4 @@
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
 use wkdmgr_core::config::Config;
 use wkdmgr_query::{build_app, AppState};
 
@@ -15,10 +14,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::load(config_path())?;
 
-    let state = AppState {
-        db_path: Arc::new(cfg.db_path.clone()),
-        allowed_domains: Arc::new(cfg.allowed_domains.clone()),
-    };
+    let state = AppState::new(cfg.db_path.clone(), cfg.allowed_domains.clone());
     let app = build_app(state);
 
     let socket_path = &cfg.query_socket.path;

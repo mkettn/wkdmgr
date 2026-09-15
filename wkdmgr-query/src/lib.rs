@@ -3,13 +3,49 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
+    /// A lazily-(re)opened read-only handle, shared across requests so
+    /// the hot path doesn't reopen SQLite on every lookup. `None` means
+    /// the last open attempt failed (or none has been made yet); the
+    /// next request retries it. See `AppState::new` for the startup
+    /// diagnostic this enables.
+    pub db: Arc<Mutex<Option<Connection>>>,
     pub allowed_domains: Arc<Vec<String>>,
+}
+
+impl AppState {
+    /// Attempt to open `db_path` once up front so a misconfigured path or
+    /// permissions problem produces a loud, immediate `error!` log at
+    /// startup instead of only ever showing up as a per-request `404`
+    /// with a buried `warn!`. Deliberately does not fail startup on
+    /// error: `wkdmgr-query` may legitimately start before
+    /// `wkdmgr-mgmt` has created the database for the first time, and
+    /// this same path is retried lazily on every subsequent request.
+    pub fn new(db_path: PathBuf, allowed_domains: Vec<String>) -> Self {
+        let initial_conn = match wkdmgr_core::storage::open_read_only(&db_path) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                tracing::error!(
+                    "could not open database {} at startup ({e}); every WKD lookup will 404 \
+                     until this is fixed. Retrying lazily on each request -- verify db_path, \
+                     its permissions, and that wkdmgr-mgmt has created it.",
+                    db_path.display()
+                );
+                None
+            }
+        };
+        Self {
+            db_path: Arc::new(db_path),
+            db: Arc::new(Mutex::new(initial_conn)),
+            allowed_domains: Arc::new(allowed_domains),
+        }
+    }
 }
 
 /// Build the `wkdmgr-query` router: public, unauthenticated, read-only WKD
@@ -82,15 +118,26 @@ async fn lookup_and_respond(state: &AppState, domain: &str, hash: &str) -> Respo
         return not_found();
     }
 
+    let db = state.db.clone();
     let db_path = state.db_path.as_ref().clone();
     let hash_owned = hash.to_string();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
-        let conn = wkdmgr_core::storage::open_read_only(&db_path)?;
-        Ok(wkdmgr_core::storage::lookup_key_data(
-            &conn,
-            &domain_lc,
-            &hash_owned,
-        )?)
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<Vec<u8>>> {
+        let mut guard = db.lock().expect("query db mutex poisoned");
+        if guard.is_none() {
+            // Startup's open attempt failed, or this is the first
+            // request since boot before wkdmgr-mgmt ever created the
+            // file: retry lazily and cache the handle on success so we
+            // don't reopen SQLite on every single lookup thereafter.
+            match wkdmgr_core::storage::open_read_only(&db_path) {
+                Ok(conn) => *guard = Some(conn),
+                Err(e) => {
+                    tracing::warn!("could not open database {}: {e}", db_path.display());
+                    return Ok(None);
+                }
+            }
+        }
+        let conn = guard.as_ref().expect("just ensured Some above");
+        wkdmgr_core::storage::lookup_key_data(conn, &domain_lc, &hash_owned)
     })
     .await;
 

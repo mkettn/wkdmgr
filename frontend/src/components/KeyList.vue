@@ -33,6 +33,7 @@ async function onDelete(id) {
       <tr>
         <th>Address</th>
         <th>Fingerprint</th>
+        <th>Status</th>
         <th>Uploaded</th>
         <th></th>
       </tr>
@@ -41,6 +42,11 @@ async function onDelete(id) {
       <tr v-for="key in props.keys" :key="key.id">
         <td class="mono">{{ key.address }}</td>
         <td class="mono fingerprint">{{ key.fingerprint }}</td>
+        <td>
+          <span :class="['badge', key.revoked ? 'badge--revoked' : 'badge--published']">
+            {{ key.revoked ? 'revoked' : 'published' }}
+          </span>
+        </td>
         <td>{{ new Date(key.uploaded_at).toLocaleString() }}</td>
         <td class="actions">
           <button
@@ -48,7 +54,7 @@ async function onDelete(id) {
             :disabled="pendingId === key.id"
             @click="onDelete(key.id)"
           >
-            {{ pendingId === key.id ? 'Revoking…' : 'Revoke' }}
+            {{ pendingId === key.id ? 'Removing…' : 'Remove' }}
           </button>
         </td>
       </tr>
@@ -96,6 +102,23 @@ async function onDelete(id) {
 .fingerprint {
   font-size: 0.78rem;
   color: var(--muted);
+}
+
+.badge {
+  font-size: 0.72rem;
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  white-space: nowrap;
+}
+
+.badge--published {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+
+.badge--revoked {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
 }
 
 .actions {
