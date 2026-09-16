@@ -8,10 +8,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
-/// The base schema, as it has always shipped (including `revoked`,
-/// added inline before this file had any migration mechanism). This is
-/// only ever a no-op against a database that already has the table --
-/// see `MIGRATIONS` for anything added since.
+/// The full schema, as it currently ships. Pre-1.0, there's no released
+/// version and no database anyone needs to keep across a schema change --
+/// the answer to an old on-disk shape is "delete it and start over", not
+/// "migrate it" -- so every column lives here rather than being bolted
+/// on via `MIGRATIONS` after the fact.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS keys (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS keys (
     key_data    BLOB NOT NULL,
     uploaded_at TEXT NOT NULL,
     revoked     INTEGER NOT NULL DEFAULT 0,
+    expires_at  TEXT,
     UNIQUE(domain, wkd_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_keys_uid ON keys(uid);
@@ -31,23 +33,31 @@ CREATE INDEX IF NOT EXISTS idx_keys_domain_hash ON keys(domain, wkd_hash);
 
 /// Migrations applied on top of `SCHEMA`, tracked via `PRAGMA
 /// user_version` so `open_writable` brings an *already-existing*
-/// database up to date. `CREATE TABLE IF NOT EXISTS` only ever runs
-/// against a database that doesn't have the table yet, so adding a
-/// column directly to `SCHEMA` -- as this file used to do -- silently
-/// no-ops on every database that predates it, and every subsequent
-/// query against that column then fails outright.
+/// database up to date -- for the first post-1.0 column, not for any
+/// shape from before this shipped (see `SCHEMA`'s doc comment). Empty
+/// for now; the mechanism is kept wired up and exercised
+/// (`open_writable_is_idempotent_across_repeated_opens`) so the first
+/// real entry lands on a tested path.
 ///
 /// Append-only from here: add new entries at the end; never edit or
 /// reorder one that has already shipped, since `user_version` records
 /// how many of these have already run.
-const MIGRATIONS: &[&str] = &["ALTER TABLE keys ADD COLUMN expires_at TEXT;"];
+const MIGRATIONS: &[&str] = &[];
 
+/// Applies each pending migration in its own transaction -- the DDL and
+/// the `user_version` bump that records it happening atomically, so a
+/// crash between them can never leave a column added but `user_version`
+/// still reporting it pending (which would otherwise fail every
+/// subsequent start with "duplicate column name", permanently, until
+/// someone hand-edits `user_version`).
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let current = usize::try_from(current.max(0)).unwrap_or(0);
     for (i, migration) in MIGRATIONS.iter().enumerate().skip(current) {
-        conn.execute_batch(migration)?;
-        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(migration)?;
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -110,6 +120,15 @@ pub fn open_read_only(db_path: &Path) -> rusqlite::Result<Connection> {
 pub enum InsertError {
     #[error("a key already exists for this domain/address")]
     Duplicate,
+    /// The row at `(domain, wkd_hash)` is owned by neither the caller
+    /// nor the uid `replace_if_owned_by` named -- e.g. a concurrent
+    /// upload replaced it between the caller's `UserDb` check and this
+    /// call. Distinct from `Duplicate` so the caller can give a message
+    /// that doesn't claim the caller's own key is what's in the way.
+    #[error(
+        "a key already exists for this domain/address, owned by someone else who still owns it"
+    )]
+    OwnedByOther,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -159,20 +178,24 @@ pub fn existing_owner(
 /// requiring an explicit delete first for your own key keeps the API
 /// contract's "don't silently overwrite" guarantee.
 ///
-/// If it's published under a *different* uid, the caller decides via
-/// `replace_existing` (see `existing_owner`): `true` only when that
-/// other uid has been independently confirmed to no longer own the
-/// address (a genuine reassignment -- the old owner's stale key would
-/// otherwise keep being served forever, and the new owner could never
-/// publish at all, since `UNIQUE(domain, wkd_hash)` would 409 them and
-/// uid-scoped delete can't touch a row it doesn't own either). `false`
-/// -- e.g. a shared/role address two uids currently both legitimately
-/// own -- still 409s, the same as the same-uid case, rather than
-/// silently handing the address to whoever uploads next.
+/// If it's published under a *different* uid, the caller authorizes a
+/// replacement by passing that uid as `replace_if_owned_by` (see
+/// `existing_owner`) -- only after independently confirming via
+/// `UserDb` that the uid no longer owns the address (a genuine
+/// reassignment; see `wkdmgr_mgmt`'s `upload_key` handler). The row's
+/// *current* owner is re-read inside this function's own transaction
+/// and compared against `replace_if_owned_by` -- carrying the identity
+/// the decision was made about, rather than a bare `bool` conclusion,
+/// means a row that changed hands between the caller's check and this
+/// call (e.g. a concurrent upload) fails closed as `OwnedByOther`
+/// instead of deleting whoever's row happens to be there now. Passing
+/// `None` -- e.g. a shared/role address the existing uid still owns
+/// too -- 409s the same as the same-uid case, rather than silently
+/// handing the address to whoever uploads next.
 pub fn insert_key(
     conn: &mut Connection,
     new_key: &NewKey,
-    replace_existing: bool,
+    replace_if_owned_by: Option<&str>,
 ) -> Result<KeyRecord, InsertError> {
     let tx = conn.transaction()?;
 
@@ -188,14 +211,14 @@ pub fn insert_key(
         Some(ref existing) if existing == new_key.uid => {
             return Err(InsertError::Duplicate);
         }
-        Some(_) if replace_existing => {
+        Some(ref existing) if replace_if_owned_by == Some(existing.as_str()) => {
             tx.execute(
                 "DELETE FROM keys WHERE domain = ?1 AND wkd_hash = ?2",
                 params![new_key.domain, new_key.wkd_hash],
             )?;
         }
         Some(_) => {
-            return Err(InsertError::Duplicate);
+            return Err(InsertError::OwnedByOther);
         }
         None => {}
     }
@@ -317,7 +340,7 @@ mod tests {
         let rec = insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(rec.uid, "alice");
@@ -346,14 +369,14 @@ mod tests {
         insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
-            false,
+            None,
         )
         .unwrap();
 
         let err = insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "EEEE5678", b"other key bytes"),
-            false,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, InsertError::Duplicate));
@@ -361,9 +384,10 @@ mod tests {
 
     /// The address-reassignment fix: a different uid uploading for an
     /// address already on file under someone else replaces that row
-    /// when the caller has told `insert_key` to (`replace_existing =
-    /// true`) -- which the mgmt handler only does after confirming via
-    /// `UserDb` that the *old* uid no longer owns the address.
+    /// when the caller has told `insert_key` to (`replace_if_owned_by =
+    /// Some("alice")`) -- which the mgmt handler only does after
+    /// confirming via `UserDb` that the *old* uid no longer owns the
+    /// address.
     #[test]
     fn upload_from_new_owner_replaces_old_owners_row_when_told_to() {
         let dir = tempfile::tempdir().unwrap();
@@ -373,14 +397,14 @@ mod tests {
         let old = insert_key(
             &mut conn,
             &new_key("alice", "role@example.com", "AAAA1111", b"alice's key"),
-            false,
+            None,
         )
         .unwrap();
 
         let new = insert_key(
             &mut conn,
             &new_key("bob", "role@example.com", "BBBB2222", b"bob's key"),
-            true,
+            Some("alice"),
         )
         .unwrap();
         assert_eq!(new.uid, "bob");
@@ -397,14 +421,16 @@ mod tests {
         assert_eq!(data, Some(b"bob's key".to_vec()));
     }
 
-    /// The shared/concurrent-ownership fix: without `replace_existing`,
-    /// a different uid's upload still 409s instead of silently taking
-    /// over the address -- this is what the mgmt handler does when the
-    /// existing row's uid still owns the address per `UserDb` too (a
-    /// role address two people legitimately hold at once), as opposed
-    /// to a genuine reassignment.
+    /// The shared/concurrent-ownership fix: without a matching
+    /// `replace_if_owned_by`, a different uid's upload still 409s
+    /// instead of silently taking over the address -- this is what the
+    /// mgmt handler does when the existing row's uid still owns the
+    /// address per `UserDb` too (a role address two people legitimately
+    /// hold at once), as opposed to a genuine reassignment. It's
+    /// `OwnedByOther` rather than `Duplicate`: the caller's own key
+    /// isn't what's in the way, someone else's still-valid one is.
     #[test]
-    fn upload_from_different_owner_without_replace_flag_is_rejected() {
+    fn upload_from_different_owner_without_matching_replace_authorization_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("meta.sqlite3");
         let mut conn = open_writable(&db_path).unwrap();
@@ -412,17 +438,17 @@ mod tests {
         insert_key(
             &mut conn,
             &new_key("alice", "support@example.com", "AAAA1111", b"alice's key"),
-            false,
+            None,
         )
         .unwrap();
 
         let err = insert_key(
             &mut conn,
             &new_key("bob", "support@example.com", "BBBB2222", b"bob's key"),
-            false,
+            None,
         )
         .unwrap_err();
-        assert!(matches!(err, InsertError::Duplicate));
+        assert!(matches!(err, InsertError::OwnedByOther));
 
         // Alice's row is untouched.
         let alices_keys = list_keys_for_uid(&conn, "alice").unwrap();
@@ -431,6 +457,60 @@ mod tests {
         assert!(list_keys_for_uid(&conn, "bob").unwrap().is_empty());
         let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
         assert_eq!(data, Some(b"alice's key".to_vec()));
+    }
+
+    /// The TOCTOU fix: `replace_if_owned_by` carries the identity the
+    /// caller's decision was made about, and `insert_key` re-checks it
+    /// against the row's *current* owner inside its own transaction --
+    /// so a row that changed hands between the caller's `UserDb` check
+    /// and this call (a concurrent upload winning the race) is never
+    /// silently deleted out from under its new, legitimate owner.
+    #[test]
+    fn stale_replace_authorization_does_not_delete_a_different_current_owners_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+        let mut conn = open_writable(&db_path).unwrap();
+
+        // alice originally owned the address; a caller peeked that and
+        // (elsewhere, not modeled here) confirmed via UserDb that alice
+        // no longer owns it, authorizing replacement with
+        // `Some("alice")`.
+        insert_key(
+            &mut conn,
+            &new_key("alice", "support@example.com", "AAAA1111", b"alice's key"),
+            None,
+        )
+        .unwrap();
+
+        // Before that authorized replacement lands, carol -- who still
+        // legitimately co-owns the address -- uploads first, replacing
+        // alice's row for real (Some("alice") correctly matches the
+        // current owner here).
+        insert_key(
+            &mut conn,
+            &new_key("carol", "support@example.com", "CCCC3333", b"carol's key"),
+            Some("alice"),
+        )
+        .unwrap();
+
+        // The original caller's insert now arrives, still carrying the
+        // stale `Some("alice")` authorization -- but the row's current
+        // owner is carol, not alice, so this must fail closed rather
+        // than deleting carol's still-current key.
+        let err = insert_key(
+            &mut conn,
+            &new_key("bob", "support@example.com", "BBBB2222", b"bob's key"),
+            Some("alice"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, InsertError::OwnedByOther));
+
+        let carols_keys = list_keys_for_uid(&conn, "carol").unwrap();
+        assert_eq!(carols_keys.len(), 1);
+        assert_eq!(carols_keys[0].fingerprint, "CCCC3333");
+        assert!(list_keys_for_uid(&conn, "bob").unwrap().is_empty());
+        let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
+        assert_eq!(data, Some(b"carol's key".to_vec()));
     }
 
     #[test]
@@ -447,7 +527,7 @@ mod tests {
         insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
-            false,
+            None,
         )
         .unwrap();
 
@@ -466,7 +546,7 @@ mod tests {
             insert_key(
                 &mut conn,
                 &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
-                false,
+                None,
             )
             .unwrap();
         }
@@ -492,7 +572,7 @@ mod tests {
             b"revoked key bytes",
         );
         key.revoked = true;
-        let rec = insert_key(&mut conn, &key, false).unwrap();
+        let rec = insert_key(&mut conn, &key, None).unwrap();
         assert!(rec.revoked);
 
         // Still visible to its owner (so they can see/manage it)...
@@ -518,7 +598,7 @@ mod tests {
             b"expired key bytes",
         );
         key.expires_at = Some(Utc::now() - chrono::Duration::days(1));
-        let rec = insert_key(&mut conn, &key, false).unwrap();
+        let rec = insert_key(&mut conn, &key, None).unwrap();
         assert!(rec.expires_at.is_some());
 
         assert_eq!(list_keys_for_uid(&conn, "alice").unwrap().len(), 1);
@@ -534,7 +614,7 @@ mod tests {
 
         let mut key = new_key("alice", "alice@example.com", "ABCD1234", b"live key bytes");
         key.expires_at = Some(Utc::now() + chrono::Duration::days(365));
-        insert_key(&mut conn, &key, false).unwrap();
+        insert_key(&mut conn, &key, None).unwrap();
 
         let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
         assert_eq!(data, Some(b"live key bytes".to_vec()));
@@ -546,48 +626,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let later = Utc::now();
         assert!(rfc3339_secs(earlier) < rfc3339_secs(later));
-    }
-
-    /// The migration-on-open fix: a database built against the schema
-    /// as it shipped before `expires_at` existed (has `revoked` inline,
-    /// no migration mechanism ever ran) must come out fully usable after
-    /// `open_writable`, not merely open successfully and then fail every
-    /// subsequent query with "no such column: expires_at".
-    #[test]
-    fn open_writable_migrates_a_pre_expires_at_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("meta.sqlite3");
-
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE keys (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    uid         TEXT NOT NULL,
-                    domain      TEXT NOT NULL,
-                    address     TEXT NOT NULL,
-                    wkd_hash    TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    key_data    BLOB NOT NULL,
-                    uploaded_at TEXT NOT NULL,
-                    revoked     INTEGER NOT NULL DEFAULT 0,
-                    UNIQUE(domain, wkd_hash)
-                );",
-            )
-            .unwrap();
-        }
-
-        let mut conn = open_writable(&db_path).unwrap();
-        let rec = insert_key(
-            &mut conn,
-            &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
-            false,
-        )
-        .unwrap();
-        assert_eq!(rec.expires_at, None);
-        assert_eq!(list_keys_for_uid(&conn, "alice").unwrap().len(), 1);
-        let data = lookup_key_data(&conn, "example.com", "somehash").unwrap();
-        assert_eq!(data, Some(b"key bytes".to_vec()));
     }
 
     #[test]
@@ -602,8 +640,46 @@ mod tests {
         insert_key(
             &mut conn,
             &new_key("alice", "alice@example.com", "ABCD1234", b"key bytes"),
-            false,
+            None,
         )
         .unwrap();
+    }
+
+    /// The migration-atomicity fix: applying a migration and stamping
+    /// `user_version` happen in one transaction, so a migration that
+    /// fails partway through -- or a process that dies between the DDL
+    /// and the stamp -- never leaves `user_version` claiming a migration
+    /// ran when its DDL didn't commit (which would otherwise wedge every
+    /// subsequent start: the same `ALTER TABLE` re-runs and fails with
+    /// "duplicate column name", permanently, until someone hand-edits
+    /// `user_version`).
+    #[test]
+    fn failed_migration_does_not_advance_user_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.sqlite3");
+        let conn = open_writable(&db_path).unwrap();
+
+        // Simulate a migration whose DDL fails outright (the column
+        // already exists) -- `run_migrations` itself only ever runs
+        // `MIGRATIONS` (currently empty), so this exercises the same
+        // per-migration transaction directly.
+        let before: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE keys ADD COLUMN revoked TEXT;")?;
+            tx.pragma_update(None, "user_version", before + 1)?;
+            tx.commit()
+        })();
+        assert!(result.is_err(), "duplicate column add must fail");
+
+        let after: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a failed migration's transaction must not leave user_version bumped"
+        );
     }
 }

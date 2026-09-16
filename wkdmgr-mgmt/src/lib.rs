@@ -390,12 +390,18 @@ async fn upload_key(
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // A row already published under a *different* uid: only replace it if
-    // that uid no longer owns the address per `UserDb` (a genuine
-    // reassignment). If it still does, this is a shared/role address and
-    // the upload is refused with a distinct message rather than silently
-    // taking it over -- see `wkdmgr_core::storage::insert_key`.
-    let replace_existing = match &existing_owner {
+    // A row already published under a *different* uid: only authorize
+    // replacing it if that uid no longer owns the address per `UserDb`
+    // (a genuine reassignment). If it still does, this is a shared/role
+    // address and the upload is refused with a distinct message rather
+    // than silently taking it over. This check and the actual insert
+    // are separated by an await (the UserDb round trip below), so the
+    // row on file can change in between -- `insert_key` re-checks the
+    // row's *current* owner against this exact uid inside its own
+    // transaction and fails closed (`OwnedByOther`) if it no longer
+    // matches, rather than trusting this decision blindly. See
+    // `wkdmgr_core::storage::insert_key`.
+    let replace_if_owned_by = match &existing_owner {
         Some(existing_uid) if existing_uid != &uid.0 => {
             let still_owns = state
                 .userdb
@@ -407,9 +413,9 @@ async fn upload_key(
             if still_owns {
                 return Err(ApiError::already_exists_shared(&body.address));
             }
-            true
+            Some(existing_uid.clone())
         }
-        _ => false,
+        _ => None,
     };
 
     let uid_owned = uid.0.clone();
@@ -433,7 +439,7 @@ async fn upload_key(
                 revoked,
                 expires_at,
             },
-            replace_existing,
+            replace_if_owned_by.as_deref(),
         )
     })
     .await
@@ -443,6 +449,9 @@ async fn upload_key(
         Ok(rec) => rec,
         Err(wkdmgr_core::storage::InsertError::Duplicate) => {
             return Err(ApiError::already_exists(&body.address))
+        }
+        Err(wkdmgr_core::storage::InsertError::OwnedByOther) => {
+            return Err(ApiError::already_exists_shared(&body.address))
         }
         Err(e) => return Err(ApiError::internal(e.to_string())),
     };

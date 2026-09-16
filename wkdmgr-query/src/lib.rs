@@ -200,7 +200,7 @@ mod tests {
                     revoked: false,
                     expires_at: None,
                 },
-                false,
+                None,
             )
             .unwrap();
         }

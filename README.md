@@ -299,6 +299,20 @@ WAL mode (set once at startup); `wkdmgr-query` opens the same file
 strictly read-only and never writes to it. Back it up like you would any
 real datastore.
 
+### Schema migrations: start `wkdmgr-mgmt` before `wkdmgr-query` on an upgrade
+
+Only `wkdmgr-mgmt`'s `open_writable` runs schema migrations (see
+`wkdmgr_core::storage`'s `MIGRATIONS`); `wkdmgr-query`'s `open_read_only`
+neither can (it's read-only) nor probes the schema at startup -- it only
+checks that the file opens. If a future release adds a migration and
+`wkdmgr-query` is restarted onto the new binary before `wkdmgr-mgmt` has
+had a chance to run it, every lookup fails against the not-yet-added
+column with the same bare `404` as "no key published" until `wkdmgr-mgmt`
+starts and migrates the database -- the read-only connection cache
+invalidates itself on error, so `wkdmgr-query` self-heals with no restart
+needed once that happens, but there's a window. Restart `wkdmgr-mgmt`
+first on any upgrade that ships a migration.
+
 ### Directory permissions: read-only access after a clean shutdown
 
 **The directory holding `db_path` must be writable by whichever group
