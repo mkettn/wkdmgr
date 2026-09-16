@@ -171,7 +171,7 @@ wkdmgr never writes to LDAP.
 backend: ldap
 uri: ldap://localhost:389
 bind_dn: cn=admin,dc=example,dc=org
-bind_password_file: /etc/wkdmgr/ldap-bind-password   # mode 0600
+bind_password: hunter2
 base_dn: ou=users,dc=example,dc=org
 uid_attr: uid
 mail_attr: mail
@@ -181,8 +181,11 @@ timeout_secs: 10   # optional, default shown
 
 `alias_attr` has no universal default across directory schemas, so it's
 required. `uid_attr`/`mail_attr` default to `uid`/`mail` if omitted.
-The bind password lives in its own file (mode `0600`, owned by the
-service user) rather than inline in YAML, like any other secret.
+The bind password lives inline in this file, so treat `userdb.yaml`
+itself as a secret: mode `0600`, owned by the `wkdmgr-mgmt` service
+user. `wkdmgr-query` never opens `userdb_config` at all (see "Main
+config" above), so this file only ever needs to be readable by
+`wkdmgr-mgmt`.
 
 wkdmgr searches `(<uid_attr>=<uid>)` under `base_dn`, and collects the
 single-valued `mail_attr` plus every value of the multi-valued

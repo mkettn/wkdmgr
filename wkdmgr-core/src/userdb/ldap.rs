@@ -28,20 +28,10 @@ impl LdapUserDb {
             );
         }
 
-        let bind_password = std::fs::read_to_string(&cfg.bind_password_file)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "reading LDAP bind password file {}: {e}",
-                    cfg.bind_password_file.display()
-                )
-            })?
-            .trim_end_matches(['\n', '\r'])
-            .to_string();
-
         Ok(Self {
             uri: cfg.uri,
             bind_dn: cfg.bind_dn,
-            bind_password,
+            bind_password: cfg.bind_password,
             base_dn: cfg.base_dn,
             uid_attr: cfg.uid_attr,
             mail_attr: cfg.mail_attr,
@@ -139,14 +129,11 @@ mod tests {
     use super::*;
     use crate::config::LdapUserDbConfig;
 
-    fn cfg_with_timeout(
-        timeout_secs: u64,
-        bind_password_file: std::path::PathBuf,
-    ) -> LdapUserDbConfig {
+    fn cfg_with_timeout(timeout_secs: u64) -> LdapUserDbConfig {
         LdapUserDbConfig {
             uri: "ldap://localhost".to_string(),
             bind_dn: "cn=admin,dc=example,dc=com".to_string(),
-            bind_password_file,
+            bind_password: "secret".to_string(),
             base_dn: "dc=example,dc=com".to_string(),
             uid_attr: "uid".to_string(),
             mail_attr: "mail".to_string(),
@@ -157,11 +144,7 @@ mod tests {
 
     #[test]
     fn new_rejects_zero_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let pw_file = dir.path().join("pw");
-        std::fs::write(&pw_file, "secret\n").unwrap();
-
-        let Err(err) = LdapUserDb::new(cfg_with_timeout(0, pw_file)) else {
+        let Err(err) = LdapUserDb::new(cfg_with_timeout(0)) else {
             panic!("expected LdapUserDb::new to reject timeout_secs = 0");
         };
         assert!(err.to_string().contains("timeout_secs"));
@@ -169,11 +152,7 @@ mod tests {
 
     #[test]
     fn new_accepts_nonzero_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let pw_file = dir.path().join("pw");
-        std::fs::write(&pw_file, "secret\n").unwrap();
-
-        assert!(LdapUserDb::new(cfg_with_timeout(10, pw_file)).is_ok());
+        assert!(LdapUserDb::new(cfg_with_timeout(10)).is_ok());
     }
 
     #[test]

@@ -87,7 +87,7 @@ pub struct FlatfileUserRecord {
 pub struct LdapUserDbConfig {
     pub uri: String,
     pub bind_dn: String,
-    pub bind_password_file: PathBuf,
+    pub bind_password: String,
     pub base_dn: String,
     #[serde(default = "default_uid_attr")]
     pub uid_attr: String,
@@ -162,7 +162,7 @@ users:
 backend: ldap
 uri: ldap://localhost:389
 bind_dn: cn=admin,dc=example,dc=org
-bind_password_file: /etc/wkdmgr/ldap-bind-password
+bind_password: secret
 base_dn: ou=users,dc=example,dc=org
 uid_attr: uid
 mail_attr: mail
