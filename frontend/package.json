@@ -1,0 +1,31 @@
+{
+  "name": "wkdmgr-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "predev": "npm run generate:api",
+    "dev": "vite",
+    "prebuild": "npm run generate:api",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "pretypecheck": "npm run generate:api",
+    "typecheck": "vue-tsc --noEmit",
+    "generate:spec": "cd .. && cargo run -p wkdmgr-mgmt --quiet -- --print-openapi > frontend/openapi.json",
+    "generate:types": "openapi-typescript openapi.json -o src/api-types.ts",
+    "generate:api": "npm run generate:spec && npm run generate:types"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.17.0",
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "@vue/tsconfig": "^0.9.1",
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^5.9.3",
+    "vite": "^5.2.0",
+    "vue-tsc": "^3.3.11"
+  }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "wkdmgr-mgmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wkdmgr-core = { path = "../wkdmgr-core" }
+tokio = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+rusqlite = { workspace = true }
+sequoia-openpgp = { workspace = true }
+tower-http = { version = "0.6", features = ["fs"] }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wkdmgr-query = { path = "../wkdmgr-query" }
