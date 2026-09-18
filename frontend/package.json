@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "pretypecheck": "npm run generate:api",
     "typecheck": "vue-tsc --noEmit",
-    "generate:spec": "cd .. && cargo run -p wkdmgr-mgmt --quiet -- --print-openapi > frontend/openapi.json",
+    "generate:spec": "cd .. && cargo run -p wkdmgr-mgmt --quiet --locked -- --print-openapi > frontend/openapi.json",
     "generate:types": "openapi-typescript openapi.json -o src/api-types.ts",
     "generate:api": "npm run generate:spec && npm run generate:types"
   },

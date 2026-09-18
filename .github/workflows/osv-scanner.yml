@@ -1,9 +1,11 @@
-name: OSV-Scanner Scheduled Scan
+name: OSV-Scanner
 
 on:
   schedule:
     - cron: "30 12 * * 1"
   push:
+    branches: [master]
+  pull_request:
     branches: [master]
   workflow_dispatch: {}
 
@@ -13,9 +15,32 @@ permissions:
   contents: read
 
 jobs:
+  # Full scan of whatever's on the branch. The Security > Code scanning
+  # dashboard is the authoritative place to see standing vulnerabilities
+  # in dependencies already on master, so this doesn't fail the job: a
+  # newly published advisory against a dependency nobody just touched
+  # shouldn't turn an unrelated push (or every Monday's scheduled run)
+  # red.
   scan-scheduled:
+    if: ${{ github.event_name != 'pull_request' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.6.0"
     with:
       scan-args: |-
         --lockfile=Cargo.lock
         --lockfile=./frontend/package-lock.json
+      fail-on-vuln: false
+
+  # PR variant: diffs the scan against the base branch, so it only flags
+  # vulnerabilities *newly introduced* by the PR rather than re-reporting
+  # the repo's whole existing backlog. Unlike the scan above, a PR that
+  # introduces a new vulnerable dependency is something the pushing
+  # developer can act on immediately, so this keeps the reusable
+  # workflow's default of failing the job.
+  scan-pr:
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.6.0"
+    with:
+      scan-args: |-
+        --lockfile=Cargo.lock
+        --lockfile=./frontend/package-lock.json
+      fail-on-vuln: true

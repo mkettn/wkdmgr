@@ -30,13 +30,25 @@ updates:
         patterns:
           - "*"
 
+  # Unlike cargo/npm's immutable lockfiles, every action reference in
+  # this repo's workflows is a SHA pin with a trailing version comment
+  # (see build-test.yml, osv-scanner.yml) -- keeping that pin current
+  # for a new release is a *version* update (a new commit SHA for the
+  # same named tag), not a security update, so this ecosystem needs
+  # version updates enabled to be worth anything. Grouped into one
+  # weekly PR rather than one per action, same reasoning as the
+  # security groups above.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
     groups:
       security:
         applies-to: security-updates
+        patterns:
+          - "*"
+      actions:
+        applies-to: version-updates
         patterns:
           - "*"
