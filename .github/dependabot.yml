@@ -1,0 +1,54 @@
+version: 2
+updates:
+  # wkdmgr-core / wkdmgr-mgmt / wkdmgr-query workspace, all from the root
+  # manifest -- Dependabot resolves workspace members automatically.
+  #
+  # open-pull-requests-limit: 0 disables routine version-update PRs;
+  # security-fix PRs are a separate flow and aren't subject to that
+  # limit. The "security" group with applies-to: security-updates
+  # batches every vulnerable dependency found in a given run into one
+  # PR per ecosystem instead of one PR per CVE.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Unlike cargo/npm's immutable lockfiles, every action reference in
+  # this repo's workflows is a SHA pin with a trailing version comment
+  # (see build-test.yml, osv-scanner.yml) -- keeping that pin current
+  # for a new release is a *version* update (a new commit SHA for the
+  # same named tag), not a security update, so this ecosystem needs
+  # version updates enabled to be worth anything. Grouped into one
+  # weekly PR rather than one per action, same reasoning as the
+  # security groups above.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
