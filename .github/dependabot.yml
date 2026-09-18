@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # wkdmgr-core / wkdmgr-mgmt / wkdmgr-query workspace, all from the root
+  # manifest -- Dependabot resolves workspace members automatically.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
